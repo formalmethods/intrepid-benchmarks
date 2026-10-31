@@ -4,15 +4,23 @@ CoCoSim on the designs of the Lockheed Martin cyber-physical challenges, as
 NASA formalized them (https://github.com/hbourbouh/lm_challenges).
 
     python simulink/harness.py fetch [--into third_party/lm_challenges]
+    python simulink/harness.py fetch-cocosim [--into third_party/cocosim]
     python simulink/harness.py run OUT.jsonl [--modes float,real] [--timeout 120]
         [--filter REGEX] [--suite PATH]
+    python simulink/harness.py sldv OUT.jsonl --matlab MATLAB [--timeout 120] ...
+    python simulink/harness.py cocosim OUT.jsonl --matlab MATLAB --kind2 KIND2
+        --z3 Z3 [--timeout 120] ...
+    python simulink/harness.py kind2 OUT.jsonl --kind2 KIND2 --z3 Z3
+        [--timeout 120] ...
     python simulink/harness.py reported OUT.json [--suite PATH]
     python simulink/harness.py report OUT.jsonl... --reported REPORTED.json
         [--out results/report.md]
 
 fetch clones the challenges at the commit the benchmark is made for. The
 models are not copied anywhere: they stay in that checkout, on the machine
-that runs the benchmark.
+that runs the benchmark (CoCoSim works on a copy of a model in a temporary
+folder, removed after). fetch-cocosim clones CoCoSim, and sets it up as its
+installer does (simulink/matlab.py).
 
 run translates each SLDV model of the suite (FRET_CoCoSim/*/SLDV) with
 intrepyd's Simulink translator, once per mode, and checks each of its
@@ -28,6 +36,23 @@ real, as reals, which is what SLDV's rational arithmetic does; both with the
 inputs within the design ranges of their Inports, as SLDV takes them.
 float-finite and float-free are floats without the design ranges, with the
 inputs only finite, or anything, NaN included.
+
+sldv, cocosim and kind2 measure the other tools on this machine, on the same
+SLDV models, one model at a time, each into its OUT (and resumable as run):
+
+- sldv: SLDV's property proving, with MATLAB (simulink/matlab/sldv_prove.m);
+- cocosim: CoCoSim's Lustre of the model (simulink/matlab/cocosim_lustre.m),
+  then Kind2 on it, with the options of CoCoSim's verification; CoCoSim's
+  mapping names each property after its Assertion or Proof Objective block;
+- kind2: Kind2 on the Lustre that CoCoSim made in 2019 of the CoCoSim models
+  of the suite (FRET_CoCoSim/*/CoCoSim/cocosim_output), as the suite's
+  results were made, without MATLAB. Their properties are the requirements
+  of contracts: each is given the block of the SLDV model it names, when
+  one does (requirement_key).
+
+SLDV and Kind2 have a time limit for the whole analysis of a model: they are
+given --timeout times the number of properties of the model, what intrepid
+would take at most.
 
 reported reads the results that the suite reports: SLDV's reports
 (FRET_CoCoSim/*/SLDV/sldv_output/*/*_report*.html, from 2019) and Kind2's on
@@ -55,6 +80,9 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ElementTree
+import zipfile
+
+import matlab
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -77,6 +105,13 @@ MODE_TITLES = {
     'float-finite': 'intrepid, floats, finite inputs, no ranges',
     'float-free': 'intrepid, floats, no constraint on the inputs',
 }
+# the other tools, measured here: their mode -> title
+TOOL_TITLES = {
+    'sldv': 'SLDV, measured',
+    'cocosim': 'CoCoSim and Kind2, measured',
+    'kind2-2019': "Kind2 on CoCoSim's Lustre of 2019, measured",
+}
+MODE_TITLES.update(TOOL_TITLES)
 # The verdicts, in the order of the report's totals
 VERDICTS = ('valid', 'valid under approximation', 'falsified', 'falsified, not confirmed',
             'undecided', 'unsupported', 'error')
@@ -228,23 +263,29 @@ def read_jsonl(path):
     return records
 
 
-def run(arguments):
-    """Runs every model in every mode not in OUT yet, each in a process of its own"""
+def run_models(arguments, modes, info, check):
+    """For each model of the suite (--filter's) and mode not in OUT yet,
+    check(suite, model, mode, emit), which emit(record)s each result and says
+    whether the model is done. OUT is appended to as results come; its first
+    line is info(), on what and with what they were measured."""
     suite = os.path.abspath(arguments.suite)
     if not os.path.isdir(os.path.join(suite, 'FRET_CoCoSim')):
         raise SystemExit(f'no suite in {suite}: run "python simulink/harness.py fetch" first')
-    modes = arguments.modes.split(',')
-    for mode in modes:
-        if mode not in MODES:
-            raise SystemExit(f'unknown mode {mode}: {", ".join(MODES)}')
     out_path = os.path.abspath(arguments.out)
     done = {(r['model'], r['mode']) for r in read_jsonl(out_path) if r.get('kind') == 'done'}
     with open(out_path, 'a', encoding='utf-8') as out:
         if not read_jsonl(out_path):
-            info = machine()
-            info.update(timeout=arguments.timeout, suite_commit=LM_COMMIT)
-            out.write(json.dumps(info) + '\n')
+            record = info()
+            record.update(timeout=arguments.timeout, suite_commit=LM_COMMIT)
+            out.write(json.dumps(record) + '\n')
             out.flush()
+
+        def emit(record):
+            out.write(json.dumps(record) + '\n')
+            out.flush()
+            print(f'  {record.get("property")}: {record["verdict"]}'
+                  + (f' in {record["time"]} s' if record.get('time') is not None else ''), flush=True)
+
         for model in models(suite):
             if arguments.filter and not re.search(arguments.filter, model):
                 continue
@@ -252,28 +293,307 @@ def run(arguments):
                 if (model_name(model), mode) in done:
                     continue
                 print(f'{model_name(model)} ({mode})', flush=True)
-                command = [sys.executable, os.path.abspath(__file__), 'check', model, mode,
-                           '--timeout', str(arguments.timeout), '--suite', suite]
-                # in a folder of its own: what the check leaves behind (intrepid
-                # writes trace.cpp where it meets an error) goes with it
-                scratch = tempfile.mkdtemp(prefix='simulink-check-')
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True,  # pylint: disable=consider-using-with
-                                           cwd=scratch)
-                for line in process.stdout:
-                    if line.startswith('{'):
-                        record = json.loads(line)
-                        out.write(line)
-                        out.flush()
-                        print(f'  {record.get("property")}: {record["verdict"]}'
-                              + (f' in {record["time"]} s' if 'time' in record else ''), flush=True)
-                status = process.wait()
-                shutil.rmtree(scratch, ignore_errors=True)
-                if status == 0:
+                if check(suite, model, mode, emit):
                     out.write(json.dumps({'kind': 'done', 'model': model_name(model), 'mode': mode}) + '\n')
                     out.flush()
                 else:
-                    print(f'  the check of {model_name(model)} ({mode}) failed: run it again to retry it',
-                          flush=True)
+                    print(f'  {model_name(model)} ({mode}) failed: run it again to retry it', flush=True)
+
+
+def run(arguments):
+    """Runs intrepid on every model in every mode not in OUT yet, each in a
+    process of its own"""
+    modes = arguments.modes.split(',')
+    for mode in modes:
+        if mode not in MODES:
+            raise SystemExit(f'unknown mode {mode}: {", ".join(MODES)}')
+
+    def check(suite, model, mode, emit):
+        command = [sys.executable, os.path.abspath(__file__), 'check', model, mode,
+                   '--timeout', str(arguments.timeout), '--suite', suite]
+        # in a folder of its own: what the check leaves behind (intrepid
+        # writes trace.cpp where it meets an error) goes with it
+        scratch = tempfile.mkdtemp(prefix='simulink-check-')
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, cwd=scratch) as process:
+            for line in process.stdout:
+                if line.startswith('{'):
+                    emit(json.loads(line))
+            status = process.wait()
+        shutil.rmtree(scratch, ignore_errors=True)
+        return status == 0
+
+    run_models(arguments, modes, machine, check)
+
+
+# Running SLDV, CoCoSim and Kind2
+
+def _p(element, name):
+    for child in element.findall('P'):
+        if child.get('Name') == name:
+            return child.text
+    return None
+
+
+def property_blocks(suite, model):
+    """The Assertion and Proof Objective blocks of an SLX model: their paths
+    from the model's root (as intrepid names its targets) -> the names that
+    may be the requirement they check, theirs and that of the block feeding
+    them. {} for an MDL."""
+    if not model.endswith('.slx'):
+        return {}
+    with zipfile.ZipFile(os.path.join(suite, model)) as archive:
+        root = ElementTree.fromstring(archive.read('simulink/blockdiagram.xml'))
+    found = {}
+
+    def walk(system, path):
+        blocks = {block.get('SID'): block for block in system.findall('Block')}
+        for block in system.findall('Block'):
+            name = block.get('Name', '')
+            is_property = block.get('BlockType') == 'Assertion' or 'Proof Objective' in (
+                _p(block, 'SourceBlock') or '')
+            if is_property:
+                names = [name]
+                for line in system.findall('Line'):
+                    destinations = [_p(line, 'Dst')] + [_p(branch, 'Dst') for branch in line.iter('Branch')]
+                    source = _p(line, 'Src')
+                    if source and any(d and d.split('#')[0] == block.get('SID') for d in destinations):
+                        feeding = blocks.get(source.split('#')[0])
+                        if feeding is not None:
+                            names.append(feeding.get('Name', ''))
+                found[path + name] = names
+            inner = block.find('System')
+            if inner is not None:
+                walk(inner, path + name + '/')
+
+    walk(root.find('Model/System'), '')
+    return found
+
+
+def requirement_key(name, lustre=False):
+    """What a requirement's names have in common: AP-003A, of a block, and
+    AP_minus_003A_3098_002, of a guarantee in CoCoSim's Lustre (lustre), both
+    ap003a; roll_hold_mode_ensure_3648_001, of a mode, and roll_hold_mode.
+    CoCoSim ends the Lustre names with the block's SID"""
+    if lustre:
+        name = re.sub(r'_\d+_\d+$', '', name)
+        name = re.sub(r'_ensure$', '', name).replace('_minus_', '')
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def sldv_status_verdict(status):
+    """The verdict of an SLDV objective's status, as in its data file"""
+    status = status.lower()
+    if status == 'valid':
+        return 'valid'
+    if status.startswith('valid under approximation'):
+        return 'valid under approximation'
+    if status == 'falsified':
+        return 'falsified'
+    if status.startswith('falsified'):
+        return 'falsified, not confirmed'
+    return 'undecided'
+
+
+def kind2_version(kind2):
+    try:
+        return subprocess.run([kind2, '--version'], capture_output=True, text=True, check=False,
+                              timeout=60).stdout.strip()
+    except OSError as error:
+        return f'not available: {error}'
+
+
+def run_kind2(kind2, z3, lustre, options, seconds):
+    """Kind2 on lustre, with z3 as its solver and options, within seconds;
+    its properties, with their verdicts and times, its version, and the
+    seconds it took"""
+    with tempfile.TemporaryDirectory(prefix='kind2-') as folder:
+        command = [kind2, '-xml', '--disable', 'IC3IA', '--smt_solver', 'Z3', '--z3_bin', z3,
+                   '--timeout', str(seconds), '--output_dir', folder] + options + [lustre]
+        started = datetime.datetime.now()
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=folder,
+                                     timeout=seconds + 120)
+        except subprocess.TimeoutExpired:
+            return None, f'Kind2 did not end within {seconds + 120} s'
+        took = (datetime.datetime.now() - started).total_seconds()
+    try:
+        results = parse_kind2_results(process.stdout)
+    except ElementTree.ParseError as error:
+        return None, f'Kind2 exited with {process.returncode}: {error}: {process.stderr.strip()[:500]}'
+    # the checks of a contract's modes being reachable are not properties
+    results['properties'] = [p for p in results['properties']
+                             if p['answer'] not in ('reachable', 'unreachable')]
+    results['seconds'] = round(took, 3)
+    return results, None
+
+
+def kind2_records(base, results, names, prefix=None):
+    """The records of Kind2's results: each property under the SLDV block
+    names(its last name) gives, or under its own name"""
+    records = []
+    for prop in results['properties']:
+        last = prop['property'].rsplit('.', 1)[-1]
+        last = re.sub(r'\[\d+\]$', '', last)
+        block = names(last)
+        record = dict(base, property=block or last, verdict=prop['verdict'], time=prop['time'],
+                      engine=prop['engine'])
+        if block is None:
+            record['unmatched'] = True
+        records.append(record)
+    return records
+
+
+def tools_machine(**tools):
+    def info():
+        record = machine()
+        record.update(tools)
+        return record
+    return info
+
+
+def sldv(arguments):
+    """Runs SLDV's property proving on every model not in OUT yet"""
+    def check(suite, model, mode, emit):
+        base = {'kind': 'result', 'tool': 'sldv', 'mode': mode, 'model': model_name(model),
+                'design': design_of(model)}
+        count = max(1, len(property_blocks(suite, model)))
+        folder = tempfile.mkdtemp(prefix='simulink-sldv-')
+        out = os.path.join(folder, 'result.json')
+        mats = '{' + ', '.join(matlab.matlab_string(m) for m in data_files(suite, model)) + '}'
+        statement = (f'sldv_prove({matlab.matlab_string(arguments.cocosim)}, '
+                     f'{matlab.matlab_string(os.path.join(suite, model))}, {mats}, {arguments.timeout}, '
+                     f'{matlab.matlab_string(out)})')
+        # SLDV's own limit is on the analysis; MATLAB is given some more
+        status = matlab.run_matlab(arguments.matlab, statement, folder,
+                                   arguments.timeout * count * 2 + 600, os.path.join(folder, 'matlab.log'))
+        try:
+            with open(out, encoding='utf-8') as stream:
+                result = json.load(stream)
+        except (OSError, ValueError):
+            result = {'error': f'MATLAB ended with {status} without a result'}
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        if result.get('error') or 'objectives' not in result:
+            emit(dict(base, property=None, verdict='error', error=result.get('error', 'no objectives')))
+            return status is not None
+        root = model_name(model) + '/'
+        for objective in result['objectives'] or []:
+            block = objective.get('block', '')
+            emit(dict(base, property=block[len(root):] if block.startswith(root) else block,
+                      verdict=sldv_status_verdict(objective['status']), status=objective['status'],
+                      time=objective.get('time'), version=result.get('version'), limit=result.get('limit')))
+        return True
+
+    run_models(arguments, ['sldv'], tools_machine(matlab=arguments.matlab), check)
+
+
+def cocosim(arguments):
+    """Runs CoCoSim, then Kind2, on every model not in OUT yet"""
+    def check(suite, model, mode, emit):
+        base = {'kind': 'result', 'tool': 'cocosim', 'mode': mode, 'model': model_name(model),
+                'design': design_of(model)}
+        folder = tempfile.mkdtemp(prefix='simulink-cocosim-')
+        try:
+            # CoCoSim writes next to the model: a copy, in a folder of its own
+            copy = os.path.join(folder, os.path.basename(model))
+            shutil.copy2(os.path.join(suite, model), copy)
+            out = os.path.join(folder, 'result.json')
+            mats = '{' + ', '.join(matlab.matlab_string(m) for m in data_files(suite, model)) + '}'
+            statement = (f'cocosim_lustre({matlab.matlab_string(arguments.cocosim)}, '
+                         f'{matlab.matlab_string(os.path.abspath(arguments.kind2))}, '
+                         f'{matlab.matlab_string(os.path.abspath(arguments.z3))}, '
+                         f'{matlab.matlab_string(copy)}, {mats}, {matlab.matlab_string(out)})')
+            log = os.path.join(folder, 'matlab.log')
+            status = matlab.run_matlab(arguments.matlab, statement, folder, 3600, log)
+            try:
+                with open(out, encoding='utf-8') as stream:
+                    result = json.load(stream)
+            except (OSError, ValueError):
+                result = {'failed': True, 'error': f'MATLAB ended with {status} without a result'}
+            if result.get('failed'):
+                errors = []
+                if os.path.exists(log):
+                    with open(log, encoding='utf-8', errors='replace') as stream:
+                        errors = [line.strip() for line in stream if line.startswith('(Error)')]
+                emit(dict(base, property=None, verdict='unsupported',
+                          error=result.get('error') or ' '.join(errors[:3]) or 'CoCoSim failed'))
+                return status is not None
+            properties = result.get('assertions') or []
+            if isinstance(properties, str):
+                properties = [properties]
+            options = ['--lus_main', result['top']]
+            if properties:
+                options += ['--slice_nodes', 'off', '--check_subproperties', 'true']
+            else:
+                options += ['--modular', 'true']
+            count = max(1, len(properties) or len(property_blocks(suite, model)))
+            results, error = run_kind2(arguments.kind2, arguments.z3, result['lustre'], options,
+                                       arguments.timeout * count)
+            if error:
+                emit(dict(base, property=None, verdict='error', error=error))
+                return True
+            mapping_path = os.path.join(os.path.dirname(result['lustre']), result['top'] + '_mapping.json')
+            origins = {}
+            if os.path.exists(mapping_path):
+                with open(mapping_path, encoding='utf-8') as stream:
+                    for entry in json.load(stream):
+                        if 'PropertyName' in entry:
+                            origins[entry['PropertyName']] = entry['OriginPath']
+            top = result['top'] + '/'
+
+            def names(prop):
+                origin = origins.get(prop)
+                return origin[len(top):] if origin and origin.startswith(top) else origin
+
+            base.update(translation_time=round(result.get('seconds', 0), 3), kind2=results['version'])
+            for record in kind2_records(base, results, names):
+                emit(record)
+            return True
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    run_models(arguments, ['cocosim'],
+               tools_machine(matlab=arguments.matlab, cocosim=matlab.COCOSIM_COMMIT,
+                             kind2=kind2_version(arguments.kind2), z3=arguments.z3), check)
+
+
+def lustre_2019(suite, model):
+    """The Lustre CoCoSim made in 2019 of the CoCoSim model of an SLDV model"""
+    name = re.sub(r'_SLDV$', '', model_name(model)) + '_PP.KIND2.lus'
+    found = glob.glob(os.path.join(suite, 'FRET_CoCoSim', design_of(model), 'CoCoSim', 'cocosim_output', '**',
+                                   name), recursive=True)
+    return sorted(found)[0] if found else None
+
+
+def kind2_2019(arguments):
+    """Runs Kind2 on CoCoSim's Lustre of 2019 of every model not in OUT yet"""
+    def check(suite, model, mode, emit):
+        base = {'kind': 'result', 'tool': 'kind2', 'mode': mode, 'model': model_name(model),
+                'design': design_of(model)}
+        lustre = lustre_2019(suite, model)
+        if lustre is None:
+            emit(dict(base, property=None, verdict='unsupported', error='no Lustre of CoCoSim in the suite'))
+            return True
+        blocks = property_blocks(suite, model)
+        keys = {}
+        for path, block_names in blocks.items():
+            for name in block_names:
+                keys.setdefault(requirement_key(name), path)
+        with open(lustre, encoding='utf-8') as stream:
+            count = max(1, len(blocks) or len(re.findall(r'\bguarantee\b', stream.read())))
+        # the suite's results were made with contracts: --modular, as CoCoSim
+        results, error = run_kind2(arguments.kind2, arguments.z3, lustre, ['--modular', 'true'],
+                                   arguments.timeout * count)
+        if error:
+            emit(dict(base, property=None, verdict='error', error=error))
+            return True
+        base['kind2'] = results['version']
+        for record in kind2_records(base, results, lambda prop: keys.get(requirement_key(prop, lustre=True))):
+            emit(record)
+        return True
+
+    run_models(arguments, ['kind2-2019'],
+               tools_machine(kind2=kind2_version(arguments.kind2), z3=arguments.z3), check)
 
 
 # The reported results
@@ -439,8 +759,9 @@ def totals(records):
 
 
 def plots(measured, sldv, modes, out_dir, timeout):
-    """Solved over time for each mode, and the times of the float mode against
-    SLDV's reported ones; [] without matplotlib"""
+    """Solved over time for each mode and tool, and the times of the float
+    mode against SLDV's, measured if it was, else reported; [] without
+    matplotlib"""
     try:
         import matplotlib  # pylint: disable=import-outside-toplevel
         matplotlib.use('Agg')
@@ -451,7 +772,7 @@ def plots(measured, sldv, modes, out_dir, timeout):
     figure, axes = pyplot.subplots(figsize=(6, 4))
     for mode in modes:
         times = sorted(r['time'] for r in measured.values()
-                       if r['mode'] == mode and r['verdict'] in ('valid', 'falsified') and 'time' in r)
+                       if r['mode'] == mode and r['verdict'] in ('valid', 'falsified') and r.get('time') is not None)
         cumulative, total = [], 0.0
         for time in times:
             total += time
@@ -460,25 +781,32 @@ def plots(measured, sldv, modes, out_dir, timeout):
     axes.set_xlabel('cumulative time (s), measured')
     axes.set_ylabel('properties solved')
     axes.set_xscale('symlog')
-    axes.legend()
+    axes.legend(fontsize='small')
     figure.tight_layout()
     path = os.path.join(out_dir, 'solved-over-time.png')
     figure.savefig(path, dpi=120)
     pyplot.close(figure)
     made.append(('Properties solved over time (measured)', os.path.basename(path)))
-    mode = modes[0]
+    mode = next((m for m in modes if m in MODES), None)
+    if 'sldv' in modes:
+        others = {(k[0], k[1]): r for k, r in measured.items() if k[2] == 'sldv'}
+        label, title = 'SLDV, measured (s)', 'intrepid against SLDV, both measured here'
+    else:
+        others = sldv
+        label = 'SLDV, reported in 2019 (s), another machine'
+        title = 'intrepid (measured) against SLDV (reported, another machine and year)'
     points = []
     for (model, prop, record_mode), record in measured.items():
-        objective = sldv.get((model, prop))
-        if record_mode != mode or objective is None or objective.get('time') is None or 'time' not in record:
+        other = others.get((model, prop))
+        if record_mode != mode or other is None or other.get('time') is None or record.get('time') is None:
             continue
-        points.append((max(objective['time'], 0.1), max(record['time'], 0.01)))
+        points.append((max(other['time'], 0.1), max(record['time'], 0.01)))
     if points:
         figure, axes = pyplot.subplots(figsize=(5, 5))
         axes.scatter([p[0] for p in points], [p[1] for p in points], s=12)
         axes.set_xscale('log')
         axes.set_yscale('log')
-        axes.set_xlabel('SLDV, reported in 2019 (s), another machine')
+        axes.set_xlabel(label)
         axes.set_ylabel(f'{MODE_TITLES[mode]}, measured (s)')
         axes.axhline(timeout, linestyle=':', color='grey')
         low = min(min(p) for p in points)
@@ -488,63 +816,95 @@ def plots(measured, sldv, modes, out_dir, timeout):
         path = os.path.join(out_dir, 'intrepid-vs-sldv.png')
         figure.savefig(path, dpi=120)
         pyplot.close(figure)
-        made.append(('intrepid (measured) against SLDV (reported, another machine and year)',
-                     os.path.basename(path)))
+        made.append((title, os.path.basename(path)))
     return made
+
+
+def describe(mode, info, records):
+    """What a mode or tool of the report is"""
+    if mode in MODES:
+        return {
+            'float': 'singles and doubles as IEEE floats, exactly; the inputs within the design '
+                     'ranges of their Inports, as SLDV takes them.',
+            'real': 'singles and doubles as reals, as SLDV\'s rational arithmetic; the inputs '
+                    'within their design ranges.',
+            'float-finite': 'floats; the float inputs only finite.',
+            'float-free': 'floats; the inputs anything, NaN and infinities included.'}[mode]
+    versions = sorted({str(r.get('version') or r.get('kind2')) for r in records if r.get('version') or r.get('kind2')})
+    limit = f'{info.get("timeout")} s times the number of properties of the model' if info else '?'
+    if mode == 'sldv':
+        return (f'SLDV {", ".join(versions) or "?"} ({info.get("matlab", "MATLAB") if info else "MATLAB"}), '
+                f'property proving on the SLDV model, within {limit}. Rational arithmetic, as in 2019.')
+    if mode == 'cocosim':
+        return (f'CoCoSim (`{(info or {}).get("cocosim", "?")[:7]}`) translates the SLDV model to Lustre, and '
+                f'{", ".join(versions) or "Kind2"} checks its Assertion and Proof Objective blocks with '
+                f'CoCoSim\'s options (z3 as its solver), within {limit}. The times are Kind2\'s, without '
+                'the translation.')
+    return (f'{", ".join(versions) or "Kind2"} on the Lustre that CoCoSim made in 2019 of the CoCoSim models '
+            f'(their contracts, `--modular true` as CoCoSim), within {limit}. A requirement is given '
+            'the block of the SLDV model of the same name; the others are listed under their own.')
 
 
 def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     """Writes the report of runs and of the reported results, in Markdown"""
     with open(arguments.reported, encoding='utf-8') as stream:
         given = json.load(stream)
-    info = None
+    infos = {}          # mode -> the machine record of its run
     measured = {}       # (model, property, mode) -> record
+    unmatched = {}      # (model, mode) -> Kind2's properties with no SLDV block
     unsupported = {}    # (model, mode) -> error
     unsupported_designs = set()
     for path in arguments.runs:
+        info = None
         for record in read_jsonl(path):
-            if record.get('kind') == 'machine' and info is None:
-                info = record
+            if record.get('kind') == 'machine':
+                info = info or record
             elif record.get('kind') == 'result':
+                infos.setdefault(record['mode'], info)
                 if record['property'] is None:
-                    unsupported[(record['model'], record['mode'])] = record.get('error', '')
+                    unsupported[(record['model'], record['mode'])] = (record['verdict'], record.get('error', ''))
                     unsupported_designs.add(record['design'])
+                elif record.get('unmatched'):
+                    unmatched.setdefault((record['model'], record['mode']), []).append(record)
                 else:
                     measured[(record['model'], record['property'], record['mode'])] = record
-    modes = [m for m in MODES if any(r['mode'] == m for r in measured.values())
-             or any(k[1] == m for k in unsupported)]
+    present = {k[2] for k in measured} | {k[1] for k in unsupported} | {k[1] for k in unmatched}
+    modes = [m for m in list(MODES) + list(TOOL_TITLES) if m in present]
     sldv = latest_sldv(given['sldv'])
-    run_models = {k[0] for k in measured} | {k[0] for k in unsupported}
-    if run_models:
+    analysed = {k[0] for k in measured} | {k[0] for k in unsupported}
+    if analysed:
         # the same models for every tool: those of the runs (all, or --filter's)
-        sldv = {key: objective for key, objective in sldv.items() if key[0] in run_models}
-    model_names = sorted(run_models | {k[0] for k in sldv})
+        sldv = {key: objective for key, objective in sldv.items() if key[0] in analysed}
+    model_names = sorted(analysed | {k[0] for k in sldv})
     out_dir = os.path.dirname(os.path.abspath(arguments.out))
     os.makedirs(out_dir, exist_ok=True)
     lines = ['# intrepid, SLDV and CoCoSim on the Lockheed Martin challenges', '']
     lines += ['The SLDV models of the challenges (`FRET_CoCoSim/*/SLDV`, lm_challenges at '
               f'`{given["suite_commit"][:7]}`), one property at a time.', '']
     lines += ['## How', '']
-    if info:
-        lines += [f'- **Measured** on {info.get("date")}: {info.get("cpu")}, {info.get("cores")} threads, '
-                  f'{info.get("memory_gb", "?")} GB, {info.get("platform")}; Python {info.get("python")}, '
-                  f'intrepyd {info.get("intrepyd")}, Simulink translator {info.get("translator")}; '
-                  f'{info.get("timeout")} s per property, intrepyd\'s portfolio.']
+    machines = []
     for mode in modes:
-        lines.append(f'- **{MODE_TITLES[mode]}** (`{mode}`): ' + {
-            'float': 'singles and doubles as IEEE floats, exactly; the inputs within the design '
-                     'ranges of their Inports, as SLDV takes them.',
-            'real': 'singles and doubles as reals, as SLDV\'s rational arithmetic; the inputs '
-                    'within their design ranges.',
-            'float-finite': 'floats; the float inputs only finite.',
-            'float-free': 'floats; the inputs anything, NaN and infinities included.'}[mode])
+        info = infos.get(mode)
+        if info and info not in machines:
+            machines.append(info)
+    for info in machines:
+        tools = ', '.join(MODE_TITLES[m] for m in modes if infos.get(m) is info)
+        lines.append(f'- **Measured** on {info.get("date")}: {info.get("cpu")}, {info.get("cores")} threads, '
+                     f'{info.get("memory_gb", "?")} GB, {info.get("platform")}; Python {info.get("python")}, '
+                     f'intrepyd {info.get("intrepyd")}, Simulink translator {info.get("translator")}; '
+                     f'{info.get("timeout")} s per property ({tools})'
+                     + ''.join(f'; {name} {info[name]}' for name in ('matlab', 'cocosim', 'kind2', 'z3')
+                               if info.get(name)) + '.')
+    for mode in modes:
+        records = [r for k, r in measured.items() if k[2] == mode]
+        lines.append(f'- **{MODE_TITLES[mode]}** (`{mode}`): ' + describe(mode, infos.get(mode), records))
     dates = sorted({o['date'][:10] for o in sldv.values() if o.get('date')})
     lines.append('- **SLDV: reported**, not measured: the reports in the suite '
                  f'(`sldv_output`), made from {dates[0] if dates else "?"} to {dates[-1] if dates else "?"} '
                  'on another machine, with rational arithmetic (floats approximated), each within its '
                  f'own time limit ({", ".join(sorted({str(o["limit"]) + " s" for o in sldv.values() if o.get("limit")}, key=lambda t: float(t[:-2])))} '
                  'per analysis). For each model, its latest report; an earlier run that said otherwise '
-                 'is noted. Their times are not comparable with ours.')
+                 'is noted. Their times are not comparable with the measured ones.')
     versions = sorted({k['version'] for k in given['kind2'] if k.get('version')})
     lines.append('- **CoCoSim: reported**: Kind2 '
                  f'({", ".join(versions) or "version not given"}) on CoCoSim\'s Lustre of the '
@@ -556,13 +916,17 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
     sldv_counts = totals(sldv.values())
     lines.append('| SLDV (reported) | ' + ' | '.join(str(sldv_counts[v]) for v in VERDICTS) + ' |')
     for mode in modes:
-        records = [r for r in measured.values() if r['mode'] == mode]
+        records = [r for k, r in measured.items() if k[2] == mode]
         counts = totals(records)
-        # the properties of the models not translated, as SLDV lists them
-        counts['unsupported'] += sum(1 for key in sldv if (key[0], mode) in unsupported)
+        # the properties of the models not analysed, as SLDV lists them
+        for key in sldv:
+            if (key[0], mode) in unsupported:
+                counts[unsupported[(key[0], mode)][0]] += 1
         lines.append(f'| {MODE_TITLES[mode]} | ' + ' | '.join(str(counts[v]) for v in VERDICTS) + ' |')
-    lines += ['', 'A model intrepid does not translate counts its SLDV properties as unsupported.', '']
-    for title, path in plots(measured, sldv, modes, out_dir, info.get('timeout', 0) if info else 0):
+    lines += ['', 'A model a tool does not translate counts its SLDV properties as unsupported (as errors, '
+              'when the tool failed on it). The properties of Kind2 that name no block of the SLDV model '
+              'are not counted: they are listed with their model.', '']
+    for title, path in plots(measured, sldv, modes, out_dir, machines[0].get('timeout', 0) if machines else 0):
         lines += [f'![{title}]({path})', '']
     lines += ['## Per property', '']
     disagreements = []
@@ -571,29 +935,41 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
         lines += [f'### {model}', '']
         for mode in modes:
             if (model, mode) in unsupported:
-                error = unsupported[(model, mode)].strip().splitlines()
-                lines += [f'{MODE_TITLES[mode]}: not translated: {error[0] if error else ""}', '']
+                verdict, error = unsupported[(model, mode)]
+                error = error.strip().splitlines()
+                what = 'not translated' if verdict == 'unsupported' else 'failed'
+                lines += [f'{MODE_TITLES[mode]}: {what}: {error[0] if error else ""}', '']
         lines += ['| Property | SLDV (reported) | ' + ' | '.join(MODE_TITLES[m] for m in modes) + ' |',
                   '| -------- | --------------- | ' + ' | '.join('-' * len(MODE_TITLES[m]) for m in modes) + ' |']
         for prop in properties:
             objective = sldv.get((model, prop))
             row = [cell(objective)]
+            verdicts = {'SLDV (reported)': objective['verdict']} if objective else {}
             for mode in modes:
                 record = measured.get((model, prop, mode))
                 if record is None and (model, mode) in unsupported:
-                    record = {'verdict': 'unsupported'}
+                    record = {'verdict': unsupported[(model, mode)][0]}
                 row.append(cell(record))
-                if objective and record and {objective['verdict'], record['verdict']} in (
-                        {'valid', 'falsified'}, {'valid under approximation', 'falsified'}):
-                    disagreements.append((model, prop, mode, objective['verdict'], record['verdict']))
+                if record:
+                    verdicts[MODE_TITLES[mode]] = record['verdict']
+            holds = [t for t, v in verdicts.items() if v in ('valid', 'valid under approximation')]
+            fails = [t for t, v in verdicts.items() if v == 'falsified']
+            if holds and fails:
+                disagreements.append((model, prop, holds, fails))
             lines.append(f'| {prop} | ' + ' | '.join(row) + ' |')
         lines.append('')
+        for mode in modes:
+            others = unmatched.get((model, mode))
+            if others:
+                lines += [f'{MODE_TITLES[mode]}, properties naming no block of the SLDV model: '
+                          + ', '.join(f'`{r["property"]}` {cell(r)}' for r in others), '']
     lines += ['## Disagreements', '']
     if disagreements:
-        lines += ['A property valid by one and falsified by the other. With floats, the IEEE semantics '
-                  '(rounding, overflow, NaN) can falsify what holds of rationals: each is to be explained.',
-                  '', '| Model | Property | Mode | SLDV | intrepid |', '| ----- | -------- | ---- | ---- | -------- |']
-        lines += [f'| {m} | {p} | {mode} | {a} | {b} |' for m, p, mode, a, b in disagreements]
+        lines += ['A property valid by some and falsified by others. With floats, the IEEE semantics '
+                  '(rounding, overflow, NaN) can falsify what holds of rationals; SLDV\'s "valid under '
+                  'approximation" may not hold exactly: each is to be explained.',
+                  '', '| Model | Property | Valid by | Falsified by |', '| ----- | -------- | -------- | ------------ |']
+        lines += [f'| {m} | {p} | {", ".join(h)} | {", ".join(f)} |' for m, p, h, f in disagreements]
     else:
         lines.append('None.')
     lines += ['', '## CoCoSim and Kind2 (reported), per design', '',
@@ -625,6 +1001,23 @@ def main():
     command.add_argument('--timeout', type=float, default=120.0, help='seconds per property')
     command.add_argument('--filter', help='only the models whose path matches this regular expression')
     command.add_argument('--suite', default=SUITE)
+    command = commands.add_parser('fetch-cocosim', help='clone CoCoSim at the pinned commit, and set it up')
+    command.add_argument('--into', default=matlab.COCOSIM)
+    for name, helped in (('sldv', 'run SLDV on the SLDV models (MATLAB)'),
+                         ('cocosim', 'run CoCoSim and Kind2 on the SLDV models (MATLAB)'),
+                         ('kind2', "run Kind2 on CoCoSim's Lustre of 2019 (no MATLAB)")):
+        command = commands.add_parser(name, help=helped)
+        command.add_argument('out')
+        command.add_argument('--timeout', type=float, default=120.0,
+                             help='seconds per property; an analysis has this times its properties')
+        command.add_argument('--filter', help='only the models whose path matches this regular expression')
+        command.add_argument('--suite', default=SUITE)
+        if name in ('sldv', 'cocosim'):
+            command.add_argument('--matlab', required=True, help='the MATLAB executable (or its launcher)')
+            command.add_argument('--cocosim', default=matlab.COCOSIM, help='CoCoSim, set up by fetch-cocosim')
+        if name in ('cocosim', 'kind2'):
+            command.add_argument('--kind2', required=True, help='the Kind2 executable')
+            command.add_argument('--z3', required=True, help='the z3 executable, for Kind2')
     command = commands.add_parser('check', help='(internal) check one model in one mode')
     command.add_argument('model')
     command.add_argument('mode', choices=MODES)
@@ -640,8 +1033,17 @@ def main():
     arguments = parser.parse_args()
     if arguments.command == 'fetch':
         fetch(arguments.into)
+    elif arguments.command == 'fetch-cocosim':
+        matlab.fetch_cocosim(arguments.into)
     elif arguments.command == 'run':
         run(arguments)
+    elif arguments.command in ('sldv', 'cocosim', 'kind2'):
+        for name in ('cocosim', 'kind2', 'z3'):
+            if getattr(arguments, name, None):
+                setattr(arguments, name, os.path.abspath(getattr(arguments, name)))
+        if arguments.command == 'cocosim' and not os.path.exists(os.path.join(arguments.cocosim, matlab.SETUP_MARK)):
+            raise SystemExit(f'no CoCoSim set up in {arguments.cocosim}: run "python simulink/harness.py fetch-cocosim"')
+        {'sldv': sldv, 'cocosim': cocosim, 'kind2': kind2_2019}[arguments.command](arguments)
     elif arguments.command == 'check':
         check_model(arguments.suite, arguments.model, arguments.mode, arguments.timeout,
                     lambda record: print(json.dumps(record), flush=True))

@@ -10,8 +10,9 @@ your own machine:
 - **Lustre**: intrepid against [Kind2](https://kind2-mc.github.io/kind2/) on
   the Kind2 benchmark suite.
 
-Nothing here needs a commercial license: intrepyd runs under its
-non-commercial license, which comes with it.
+intrepid's side needs no commercial license: intrepyd runs under its
+non-commercial license, which comes with it. Measuring SLDV and CoCoSim needs
+MATLAB, Simulink and Simulink Design Verifier, under your own licenses.
 
 ## Quick start
 
@@ -21,6 +22,7 @@ On Linux, with Python 3.11 or newer and git:
 make setup      # .venv, with intrepyd (and its Simulink translator) and matplotlib
 make check      # the tests of the harnesses
 make simulink   # the Simulink benchmark: results/simulink.md
+make simulink-tools MATLAB=... KIND2=... Z3=...   # SLDV, CoCoSim and Kind2 too
 make lustre     # the Lustre benchmark, intrepid alone: its report on the terminal
 ```
 
@@ -84,16 +86,43 @@ not reached then.
 A model the translator does not support counts its properties as
 `unsupported`, with the reason in the report.
 
-**SLDV and CoCoSim** are not run, for now: they need MATLAB. Their results
-are the ones the suite reports, read by `simulink/harness.py reported`:
+**SLDV and CoCoSim** run on the same SLDV models, on your machine, if you
+have MATLAB with Simulink Design Verifier (`make simulink-tools`):
+
+- `sldv`: SLDV's property proving, as the suite's reports were made
+  (`simulink/matlab/sldv_prove.m`).
+- `cocosim`: [CoCoSim](https://github.com/NASA-SW-VnV/CoCoSim) translates
+  the model to Lustre (`simulink/matlab/cocosim_lustre.m`), and
+  [Kind2](https://kind2-mc.github.io/kind2/) checks its Assertion and Proof
+  Objective blocks, with the options of CoCoSim's verification. CoCoSim's
+  mapping gives each property its block, so the three tools compare property
+  by property.
+- `kind2-2019`, which needs no MATLAB: Kind2 on the Lustre that CoCoSim made
+  of the suite's CoCoSim models in 2019 (`FRET_CoCoSim/*/CoCoSim/cocosim_output`),
+  where the requirements are contracts, as in NASA's paper. A requirement is
+  matched to the block of the SLDV model named after it (`AP_minus_003A`, of
+  the contract, to the `AP-003A` that feeds `Assertion5`); those without one
+  are listed apart.
+
+SLDV and Kind2 have a time limit for the analysis of a whole model, not per
+property: they are given `TIMEOUT` times the number of properties of the
+model, what intrepid could take at most on it.
+
+`make fetch-cocosim` clones CoCoSim at a fixed commit into
+`third_party/cocosim`, and sets it up as its installer
+(`install_cocosim_lib.m`) does, with the two repositories it takes files
+from, also at fixed commits; CoCoSim's model checkers are not built, the
+runs give it `KIND2` and `Z3`. The models of the suite link to CoCoSim's
+library, so SLDV needs it too. MATLAB runs without its desktop, but needs a
+display: some of the models do not load with `-nodisplay`. CoCoSim is
+tested with R2017b and newer; the runs here were made with R2018a.
+
+The results the suite reports are read too (`simulink/harness.py reported`):
 
 - SLDV's reports, made in 2019 with rational arithmetic, each with its own
   time limit (from 300 to 7200 s). Where a model has several reports, the
   latest one is taken, and an earlier one that said otherwise is noted.
-- Kind2's results on CoCoSim's Lustre of the `CoCoSim` models. Those
-  properties are named after the requirements (`AP_minus_003A`), not after
-  the SLDV models' blocks (`Assertion3`), so the report gives them per
-  design, beside the per-property comparison.
+- Kind2's results on CoCoSim's Lustre of the `CoCoSim` models, per design.
 
 These results come from another machine and other versions, years ago: their
 times are not comparable with the measured ones. The report says which
@@ -109,6 +138,19 @@ make simulink-reported     # results/reported.json, SLDV's and Kind2's results
 make simulink-report       # results/simulink.md, and its plots with matplotlib
 ```
 
+and, for the other tools:
+
+```bash
+make fetch-cocosim                                   # third_party/cocosim
+make simulink-kind2 KIND2=/path/to/kind2 Z3=/path/to/z3        # results/kind2-2019.jsonl
+make simulink-sldv MATLAB=/path/to/matlab                       # results/sldv.jsonl
+make simulink-cocosim MATLAB=/path/to/matlab KIND2=... Z3=...   # results/cocosim.jsonl
+make simulink-report                                 # all of them in results/simulink.md
+```
+
+`MATLAB` may be a script that starts MATLAB (with the environment your
+system needs for it): it is given MATLAB's options.
+
 The variables:
 
 - `TIMEOUT=300`: the seconds per property;
@@ -116,8 +158,8 @@ The variables:
 - `FILTER=euler`: only the models whose path matches a regular expression;
 - `RESULTS=elsewhere`: the folder of the results.
 
-`simulink-run` appends to `results/simulink.jsonl` as it goes, and skips the
-models and modes it has. An interrupted run goes on where it stopped; to run
+`simulink-run` (and each of the other tools, to its file) appends to
+`results/simulink.jsonl` as it goes, and skips the models and modes it has. An interrupted run goes on where it stopped; to run
 again from scratch, remove the file. Its first line records the machine (CPU,
 memory, system) and the versions of Python, intrepyd and the translator.
 
@@ -154,9 +196,10 @@ version intrepid is built with.
 
 | Path | What |
 | ---- | ---- |
-| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `reported`, `report` |
+| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `sldv`, `cocosim`, `kind2`, `reported`, `report` |
+| `simulink/matlab.py`, `simulink/matlab/` | CoCoSim's setup, and the MATLAB scripts of the SLDV and CoCoSim runs |
 | `lustre/harness.py`, `lustre/run_one.py` | The Lustre benchmark |
 | `lustre/kind2-benchmarks/` | The Kind2 benchmark suite |
 | `tests/` | The tests of the harnesses: `make check` |
-| `third_party/` | The fetched suites (not committed) |
+| `third_party/` | The fetched suites and CoCoSim (not committed) |
 | `results/` | The results of the runs (not committed) |
