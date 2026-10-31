@@ -39,6 +39,10 @@ try
     result.seconds = toc(started);
     result.status = status;
     result.failed = status ~= 1;
+    if status == 0 && (isempty(files) || ~isfield(files, 'DataFile') || isempty(files.DataFile))
+        % SLDV says why only in its diagnostic viewer
+        result.error = sprintf('incompatible for property proving with SLDV %s', result.version);
+    end
     if ~isempty(files) && isfield(files, 'DataFile') && ~isempty(files.DataFile)
         data = load(files.DataFile);
         data = data.sldvData;

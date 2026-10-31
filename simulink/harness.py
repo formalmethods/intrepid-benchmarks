@@ -68,6 +68,7 @@ design, and, with matplotlib, the plots next to it.
 
 import argparse
 import datetime
+import functools
 import glob
 import html.parser
 import importlib.metadata
@@ -76,6 +77,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -402,24 +404,45 @@ def kind2_version(kind2):
         return f'not available: {error}'
 
 
+@functools.cache
+def kind2_engines(kind2):
+    """The engines Kind2 can enable (IC3IA came with v1.8.0)"""
+    process = subprocess.run([kind2, '--help'], capture_output=True, text=True, check=False)
+    match = re.search(r'--enable <string>.*?can be (.*?)\n\s*Enable', process.stdout, re.DOTALL)
+    return set(re.findall(r'\w+', match.group(1))) if match else set()
+
+
 def run_kind2(kind2, z3, lustre, options, seconds):
     """Kind2 on lustre, with z3 as its solver and options, within seconds;
     its properties, with their verdicts and times, its version, and the
     seconds it took"""
     with tempfile.TemporaryDirectory(prefix='kind2-') as folder:
-        command = [kind2, '-xml', '--disable', 'IC3IA', '--smt_solver', 'Z3', '--z3_bin', z3,
+        # CoCoSim disables IC3IA, which a Kind2 before v1.8.0 does not have
+        disable = ['--disable', 'IC3IA'] if 'IC3IA' in kind2_engines(kind2) else []
+        command = [kind2, '-xml'] + disable + ['--smt_solver', 'Z3', '--z3_bin', z3,
                    '--timeout', str(seconds), '--output_dir', folder] + options + [lustre]
         started = datetime.datetime.now()
-        try:
-            process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=folder,
-                                     timeout=seconds + 120)
-        except subprocess.TimeoutExpired:
-            return None, f'Kind2 did not end within {seconds + 120} s'
+        # in a session of its own: stopped, with its solvers
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=folder,
+                              start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=seconds + 120)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                return None, f'Kind2 did not end within {seconds + 120} s'
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         took = (datetime.datetime.now() - started).total_seconds()
     try:
-        results = parse_kind2_results(process.stdout)
+        results = parse_kind2_results(stdout)
     except ElementTree.ParseError as error:
-        return None, f'Kind2 exited with {process.returncode}: {error}: {process.stderr.strip()[:500]}'
+        return None, f'Kind2 exited with {process.returncode}: {error}: {stderr.strip()[:500]}'
+    if results['errors'] and not results['properties']:
+        return None, 'Kind2: ' + '; '.join(results['errors'])
     # the checks of a contract's modes being reachable are not properties
     results['properties'] = [p for p in results['properties']
                              if p['answer'] not in ('reachable', 'unreachable')]
@@ -427,9 +450,34 @@ def run_kind2(kind2, z3, lustre, options, seconds):
     return results, None
 
 
-def kind2_records(base, results, names, prefix=None):
+LUSTRE_NODE = re.compile(r'\bnode\s+(imported\s+)?(\w+)\s*\([^)]*\)\s*returns\s*\([^)]*\)\s*;'
+                         r'(\s*let\b(.*?)\btel\b)?', re.DOTALL)
+
+
+def abstracted_nodes(lustre):
+    """The nodes of the Lustre files lustre includes that only abstract a
+    function (imported, or only asserting on their outputs, as CoCoSim's
+    sin and cos in [-1, 1]), which lustre calls"""
+    with open(lustre, encoding='utf-8', errors='replace') as stream:
+        main = re.sub(r'\(\*.*?\*\)|--[^\n]*', '', stream.read(), flags=re.DOTALL)
+    abstract = set()
+    for included in re.findall(r'\binclude\s+"([^"]+)"', main):
+        path = os.path.join(os.path.dirname(lustre), included)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            text = re.sub(r'\(\*.*?\*\)|--[^\n]*', '', stream.read(), flags=re.DOTALL)
+        for match in LUSTRE_NODE.finditer(text):
+            body = re.sub(r'\bassert\b[^;]*;', '', match.group(4) or '')
+            if match.group(1) or not re.search(r'[^<>=!]=[^=>]', body):
+                abstract.add(match.group(2))
+    return sorted(name for name in abstract if re.search(r'\b' + name + r'\s*\(', main))
+
+
+def kind2_records(base, results, names, abstractions=()):
     """The records of Kind2's results: each property under the SLDV block
-    names(its last name) gives, or under its own name"""
+    names(its last name) gives, or under its own name. Through the
+    abstractions, a counterexample may be the abstraction's: not confirmed"""
     records = []
     for prop in results['properties']:
         last = prop['property'].rsplit('.', 1)[-1]
@@ -437,6 +485,8 @@ def kind2_records(base, results, names, prefix=None):
         block = names(last)
         record = dict(base, property=block or last, verdict=prop['verdict'], time=prop['time'],
                       engine=prop['engine'])
+        if abstractions and record['verdict'] == 'falsified':
+            record.update(verdict='falsified, not confirmed', abstractions=list(abstractions))
         if block is None:
             record['unmatched'] = True
         records.append(record)
@@ -487,6 +537,22 @@ def sldv(arguments):
     run_models(arguments, ['sldv'], tools_machine(matlab=arguments.matlab), check)
 
 
+def syntax_errors(folder):
+    """The errors of Kind2 in CoCoSim's reports of a failed syntax check, under folder"""
+    errors = []
+    for path in sorted(glob.glob(os.path.join(folder, '**', '*_error_messages.html'), recursive=True)):
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            text = stream.read()
+        # Kind2's XML output, as it is, in the HTML
+        for match in re.finditer(r'<Log class="error"([^>]*)>(.*?)</Log>', text, re.DOTALL):
+            where = re.search(r'line="(\d+)" column="(\d+)" file="([^"]*)"', match.group(1))
+            message = ' '.join(re.sub(r'<[^>]*>', ' ', match.group(2)).split())
+            if where:
+                message = f'{os.path.basename(where.group(3))}:{where.group(1)}:{where.group(2)}: {message}'
+            errors.append(f'Kind2: {message}')
+    return '; '.join(dict.fromkeys(errors))
+
+
 def cocosim(arguments):
     """Runs CoCoSim, then Kind2, on every model not in OUT yet"""
     def check(suite, model, mode, emit):
@@ -494,29 +560,17 @@ def cocosim(arguments):
                 'design': design_of(model)}
         folder = tempfile.mkdtemp(prefix='simulink-cocosim-')
         try:
-            # CoCoSim writes next to the model: a copy, in a folder of its own
-            copy = os.path.join(folder, os.path.basename(model))
-            shutil.copy2(os.path.join(suite, model), copy)
-            out = os.path.join(folder, 'result.json')
-            mats = '{' + ', '.join(matlab.matlab_string(m) for m in data_files(suite, model)) + '}'
-            statement = (f'cocosim_lustre({matlab.matlab_string(arguments.cocosim)}, '
-                         f'{matlab.matlab_string(os.path.abspath(arguments.kind2))}, '
-                         f'{matlab.matlab_string(os.path.abspath(arguments.z3))}, '
-                         f'{matlab.matlab_string(copy)}, {mats}, {matlab.matlab_string(out)})')
-            log = os.path.join(folder, 'matlab.log')
-            status = matlab.run_matlab(arguments.matlab, statement, folder, 3600, log)
-            try:
-                with open(out, encoding='utf-8') as stream:
-                    result = json.load(stream)
-            except (OSError, ValueError):
-                result = {'failed': True, 'error': f'MATLAB ended with {status} without a result'}
+            # the Kind2 CoCoSim checks its Lustre's syntax with, then the
+            # fallback, if the first rejects the Lustre
+            errors = []
+            for kind2 in [arguments.kind2] + ([arguments.fallback_kind2] if arguments.fallback_kind2 else []):
+                result, status, rejected = translate(suite, model, kind2, folder)
+                if result.get('failed'):
+                    errors.append(f'{kind2_version(kind2)}: {result["error"]}' if rejected else result['error'])
+                if not result.get('failed') or not rejected:
+                    break
             if result.get('failed'):
-                errors = []
-                if os.path.exists(log):
-                    with open(log, encoding='utf-8', errors='replace') as stream:
-                        errors = [line.strip() for line in stream if line.startswith('(Error)')]
-                emit(dict(base, property=None, verdict='unsupported',
-                          error=result.get('error') or ' '.join(errors[:3]) or 'CoCoSim failed'))
+                emit(dict(base, property=None, verdict='unsupported', error='; '.join(errors)))
                 return status is not None
             properties = result.get('assertions') or []
             if isinstance(properties, str):
@@ -527,8 +581,7 @@ def cocosim(arguments):
             else:
                 options += ['--modular', 'true']
             count = max(1, len(properties) or len(property_blocks(suite, model)))
-            results, error = run_kind2(arguments.kind2, arguments.z3, result['lustre'], options,
-                                       arguments.timeout * count)
+            results, error = run_kind2(kind2, arguments.z3, result['lustre'], options, arguments.timeout * count)
             if error:
                 emit(dict(base, property=None, verdict='error', error=error))
                 return True
@@ -546,15 +599,46 @@ def cocosim(arguments):
                 return origin[len(top):] if origin and origin.startswith(top) else origin
 
             base.update(translation_time=round(result.get('seconds', 0), 3), kind2=results['version'])
-            for record in kind2_records(base, results, names):
+            for record in kind2_records(base, results, names, abstracted_nodes(result['lustre'])):
                 emit(record)
             return True
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def translate(suite, model, kind2, parent):
+        """CoCoSim's result on model, with kind2 for its syntax check, the
+        status of MATLAB, and whether kind2 rejected the Lustre"""
+        # CoCoSim writes next to the model: a copy, in a folder of its own
+        folder = tempfile.mkdtemp(dir=parent)
+        copy = os.path.join(folder, os.path.basename(model))
+        shutil.copy2(os.path.join(suite, model), copy)
+        out = os.path.join(folder, 'result.json')
+        mats = '{' + ', '.join(matlab.matlab_string(m) for m in data_files(suite, model)) + '}'
+        statement = (f'cocosim_lustre({matlab.matlab_string(arguments.cocosim)}, '
+                     f'{matlab.matlab_string(os.path.abspath(kind2))}, '
+                     f'{matlab.matlab_string(os.path.abspath(arguments.z3))}, '
+                     f'{matlab.matlab_string(copy)}, {mats}, {matlab.matlab_string(out)})')
+        log = os.path.join(folder, 'matlab.log')
+        status = matlab.run_matlab(arguments.matlab, statement, folder, 3600, log)
+        try:
+            with open(out, encoding='utf-8') as stream:
+                result = json.load(stream)
+        except (OSError, ValueError):
+            result = {'failed': True, 'error': f'MATLAB ended with {status} without a result'}
+        rejected = syntax_errors(folder)
+        if result.get('failed'):
+            errors = []
+            if os.path.exists(log):
+                with open(log, encoding='utf-8', errors='replace') as stream:
+                    errors = [line.strip() for line in stream if line.startswith('(Error)')]
+            result['error'] = (result.get('error') or rejected or ' '.join(errors[:3]) or 'CoCoSim failed')
+        return result, status, bool(rejected)
+
     run_models(arguments, ['cocosim'],
                tools_machine(matlab=arguments.matlab, cocosim=matlab.COCOSIM_COMMIT,
-                             kind2=kind2_version(arguments.kind2), z3=arguments.z3), check)
+                             kind2=kind2_version(arguments.kind2), z3=arguments.z3,
+                             **({'fallback_kind2': kind2_version(arguments.fallback_kind2)}
+                                if arguments.fallback_kind2 else {})), check)
 
 
 def lustre_2019(suite, model):
@@ -581,19 +665,31 @@ def kind2_2019(arguments):
                 keys.setdefault(requirement_key(name), path)
         with open(lustre, encoding='utf-8') as stream:
             count = max(1, len(blocks) or len(re.findall(r'\bguarantee\b', stream.read())))
-        # the suite's results were made with contracts: --modular, as CoCoSim
-        results, error = run_kind2(arguments.kind2, arguments.z3, lustre, ['--modular', 'true'],
-                                   arguments.timeout * count)
+        # the suite's results were made with contracts: --modular, as CoCoSim;
+        # the fallback Kind2, if the first rejects the Lustre
+        errors = []
+        for kind2 in [arguments.kind2] + ([arguments.fallback_kind2] if arguments.fallback_kind2 else []):
+            results, error = run_kind2(kind2, arguments.z3, lustre, ['--modular', 'true'],
+                                       arguments.timeout * count)
+            if not error:
+                break
+            errors.append(f'{kind2_version(kind2)}: {error}')
+            if not error.startswith('Kind2: '):
+                break
         if error:
+            error = '; '.join(errors)
             emit(dict(base, property=None, verdict='error', error=error))
             return True
         base['kind2'] = results['version']
-        for record in kind2_records(base, results, lambda prop: keys.get(requirement_key(prop, lustre=True))):
+        for record in kind2_records(base, results, lambda prop: keys.get(requirement_key(prop, lustre=True)),
+                                    abstracted_nodes(lustre)):
             emit(record)
         return True
 
     run_models(arguments, ['kind2-2019'],
-               tools_machine(kind2=kind2_version(arguments.kind2), z3=arguments.z3), check)
+               tools_machine(kind2=kind2_version(arguments.kind2), z3=arguments.z3,
+                             **({'fallback_kind2': kind2_version(arguments.fallback_kind2)}
+                                if arguments.fallback_kind2 else {})), check)
 
 
 # The reported results
@@ -689,8 +785,10 @@ def parse_kind2_results(text):
             'verdict': kind2_verdict(answer.text.strip() if answer is not None and answer.text else None),
             'engine': answer.get('source') if answer is not None else None,
             'time': float(runtime.text) if runtime is not None and runtime.text else None})
+    errors = [' '.join((log.text or '').split()) for log in root.iter('Log') if log.get('class') == 'error']
     timeout = root.get('timeout')
-    return {'version': version, 'timeout': float(timeout) if timeout else None, 'properties': properties}
+    return {'version': version, 'timeout': float(timeout) if timeout else None, 'properties': properties,
+            'errors': errors}
 
 
 def reported(arguments):
@@ -835,14 +933,27 @@ def describe(mode, info, records):
     if mode == 'sldv':
         return (f'SLDV {", ".join(versions) or "?"} ({info.get("matlab", "MATLAB") if info else "MATLAB"}), '
                 f'property proving on the SLDV model, within {limit}. Rational arithmetic, as in 2019.')
+    abstractions = sorted({name for r in records for name in r.get('abstractions', ())})
+    unconfirmed = (' A counterexample through a function that CoCoSim\'s library only abstracts, '
+                   f'bounding its result ({", ".join(abstractions)}; sin and cos in [-1, 1]), may be the '
+                   'abstraction\'s: "falsified, not confirmed".'
+                   if abstractions else '')
+    primary = (info or {}).get('kind2') or ''
+    others = {}
+    for record in records:
+        if record.get('kind2') and record['kind2'] not in primary:
+            others.setdefault(record['kind2'], set()).add(record['model'])
+    retried = ''.join(f' The models whose Lustre {primary} rejects were retried with {version}: '
+                      f'{", ".join(sorted(models))}.' for version, models in sorted(others.items()))
     if mode == 'cocosim':
         return (f'CoCoSim (`{(info or {}).get("cocosim", "?")[:7]}`) translates the SLDV model to Lustre, and '
                 f'{", ".join(versions) or "Kind2"} checks its Assertion and Proof Objective blocks with '
                 f'CoCoSim\'s options (z3 as its solver), within {limit}. The times are Kind2\'s, without '
-                'the translation.')
+                f'the translation.{retried}{unconfirmed}')
     return (f'{", ".join(versions) or "Kind2"} on the Lustre that CoCoSim made in 2019 of the CoCoSim models '
             f'(their contracts, `--modular true` as CoCoSim), within {limit}. A requirement is given '
-            'the block of the SLDV model of the same name; the others are listed under their own.')
+            f'the block of the SLDV model of the same name; the others are listed under their own.'
+            f'{retried}{unconfirmed}')
 
 
 def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
@@ -938,6 +1049,9 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
                 verdict, error = unsupported[(model, mode)]
                 error = error.strip().splitlines()
                 what = 'not translated' if verdict == 'unsupported' else 'failed'
+                if len(error) > 1 and error[0].endswith(':'):
+                    # a count, then one error per line
+                    error = [error[0] + ' ' + '; '.join(line.strip() for line in error[1:])]
                 lines += [f'{MODE_TITLES[mode]}: {what}: {error[0] if error else ""}', '']
         lines += ['| Property | SLDV (reported) | ' + ' | '.join(MODE_TITLES[m] for m in modes) + ' |',
                   '| -------- | --------------- | ' + ' | '.join('-' * len(MODE_TITLES[m]) for m in modes) + ' |']
@@ -1018,6 +1132,9 @@ def main():
         if name in ('cocosim', 'kind2'):
             command.add_argument('--kind2', required=True, help='the Kind2 executable')
             command.add_argument('--z3', required=True, help='the z3 executable, for Kind2')
+        if name in ('cocosim', 'kind2'):
+            command.add_argument('--fallback-kind2',
+                                 help='a Kind2 to retry the models with whose Lustre --kind2 rejects')
     command = commands.add_parser('check', help='(internal) check one model in one mode')
     command.add_argument('model')
     command.add_argument('mode', choices=MODES)
@@ -1038,7 +1155,7 @@ def main():
     elif arguments.command == 'run':
         run(arguments)
     elif arguments.command in ('sldv', 'cocosim', 'kind2'):
-        for name in ('cocosim', 'kind2', 'z3'):
+        for name in ('cocosim', 'kind2', 'fallback_kind2', 'z3'):
             if getattr(arguments, name, None):
                 setattr(arguments, name, os.path.abspath(getattr(arguments, name)))
         if arguments.command == 'cocosim' and not os.path.exists(os.path.join(arguments.cocosim, matlab.SETUP_MARK)):

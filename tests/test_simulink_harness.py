@@ -77,6 +77,12 @@ class TestReaders(unittest.TestCase):
         self.assertEqual([('Spec.REQ_001[1]', 'valid', 'ind2', 0.5), ('Spec.REQ_002[2]', 'falsified', 'bmc', 0.8),
                           ('Spec.REQ_003[3]', 'undecided', 'kind2', 300.0)],
                          [(p['property'], p['verdict'], p['engine'], p['time']) for p in results['properties']])
+        self.assertEqual([], results['errors'])
+        # a Kind2 refusing its options writes a log only
+        refused = harness.parse_kind2_results('<?xml version="1.0"?>\n<Log class="error" source="parse">\n'
+                                              "  Bad argument:\nUnexpected value 'IC3IA' for flag --enable\n</Log>")
+        self.assertEqual(["Bad argument: Unexpected value 'IC3IA' for flag --enable"], refused['errors'])
+        self.assertEqual([], refused['properties'])
 
     def test_the_latest_sldv_run_with_the_earlier_verdicts(self):
         first = {'model': 'm', 'date': '2019-11-01T16:00:00', 'source': 'a', 'limit': 300,
@@ -147,6 +153,18 @@ class TestTools(unittest.TestCase):
                              harness.property_blocks(suite, model))
             self.assertEqual({}, harness.property_blocks(suite, model[:-4] + '.mdl'))
 
+    def test_the_errors_of_a_failed_syntax_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, 'cocosim_output', 'm_PP', 'm_PP_error_messages.html')
+            os.makedirs(os.path.dirname(report))
+            with open(report, 'w', encoding='utf-8') as stream:
+                stream.write('<h5><?xml version="1.0"?><br><Results><br><Log class="info" source="parse">'
+                             'kind2 v3.0.0</Log><br><Log class="error" source="parse" line="8" column="30" '
+                             'file="/x/lustrec_math.lus"><br>  Output variable \'y\' is not defined<br>'
+                             '</Log><br></Results></h5>')
+            self.assertEqual("Kind2: lustrec_math.lus:8:30: Output variable 'y' is not defined",
+                             harness.syntax_errors(folder))
+
     def test_requirements_by_name(self):
         for block, lustre in (('AP-003A', 'AP_minus_003A_3098_002'), ('EUL_002_1', 'EUL002_1_245_150'),
                               ('roll_hold_mode', 'roll_hold_mode_ensure_3648_001'),
@@ -169,6 +187,25 @@ class TestTools(unittest.TestCase):
                                         lambda prop: keys.get(harness.requirement_key(prop, lustre=True)))
         self.assertEqual([('Spec/Assertion1', 'falsified', None), ('_one_mode_active', 'valid', True)],
                          [(r['property'], r['verdict'], r.get('unmatched')) for r in records])
+        # through an abstracted function, a counterexample is not confirmed
+        records = harness.kind2_records({'mode': 'cocosim'}, results, lambda prop: None, ['sin'])
+        self.assertEqual([('falsified, not confirmed', ['sin']), ('valid', None)],
+                         [(r['verdict'], r.get('abstractions')) for r in records])
+
+    def test_the_abstracted_functions_a_lustre_file_calls(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, 'math.lus'), 'w', encoding='utf-8') as out:
+                out.write('(* node fake (x: real) returns (y: real); *)\n'
+                          'node sin (x: real) returns (y: real) ;\nlet\n  assert (y >= -1.0 and y <= 1.0);\ntel\n'
+                          'node imported exp (x: real) returns (y: real) ;\n'
+                          'node abs (x: real) returns (y: real) ;\nlet\n  y = if x >= 0.0 then x else -x;\ntel\n'
+                          'node cos (x: real) returns (y: real) ;\nlet\n  assert (y <= 1.0);\ntel\n')
+            main = os.path.join(folder, 'main.lus')
+            with open(main, 'w', encoding='utf-8') as out:
+                out.write('include "math.lus"\ninclude "missing.lus"\n-- cos(x) in a comment\n'
+                          'node top (x: real) returns (a, b, c: real) ;\n'
+                          'let\n  a = sin(x);\n  b = abs (x);\n  c = exp(x);\ntel\n')
+            self.assertEqual(['exp', 'sin'], harness.abstracted_nodes(main))
 
 
 class TestReport(unittest.TestCase):

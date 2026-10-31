@@ -22,7 +22,8 @@ On Linux, with Python 3.11 or newer and git:
 make setup      # .venv, with intrepyd (and its Simulink translator) and matplotlib
 make check      # the tests of the harnesses
 make simulink   # the Simulink benchmark: results/simulink.md
-make simulink-tools MATLAB=... KIND2=... Z3=...   # SLDV, CoCoSim and Kind2 too
+make simulink-tools MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=...   # SLDV, CoCoSim and Kind2, measured
+make simulink-all MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=...     # all of it: intrepid and the other tools
 make lustre     # the Lustre benchmark, intrepid alone: its report on the terminal
 ```
 
@@ -112,7 +113,19 @@ model, what intrepid could take at most on it.
 `third_party/cocosim`, and sets it up as its installer
 (`install_cocosim_lib.m`) does, with the two repositories it takes files
 from, also at fixed commits; CoCoSim's model checkers are not built, the
-runs give it `KIND2` and `Z3`. The models of the suite link to CoCoSim's
+runs give it `KIND2` and `Z3`. Give `cocosim` the Kind2 that CoCoSim's
+installer takes, v1.7.0 (`scripts/install_tools`): Kind2 v2 and newer
+reject the Lustre library CoCoSim adds (its math nodes only assert on their
+outputs), Kind2 before v1.7.0 lacks the `--only_parse` of its syntax check.
+CoCoSim disables Kind2's IC3IA engine, which v1.7.0 does not have yet: the
+option is then left out. Kind2 v1.7.0 rejects the Lustre of some models
+that v3 takes ("Width lengths of equation are not equal"): with
+`COCOSIM_KIND2` different from `KIND2`, those are retried with `KIND2`, and
+the report names them. The same goes for `kind2-2019`, CoCoSim's Lustre
+too. CoCoSim's library abstracts some functions, only
+bounding their results (sin and cos in [-1, 1], sqrt, a product of reals):
+a counterexample of Kind2 through one of them is "falsified, not
+confirmed". The models of the suite link to CoCoSim's
 library, so SLDV needs it too. MATLAB runs without its desktop, but needs a
 display: some of the models do not load with `-nodisplay`. CoCoSim is
 tested with R2017b and newer; the runs here were made with R2018a.
@@ -142,9 +155,9 @@ and, for the other tools:
 
 ```bash
 make fetch-cocosim                                   # third_party/cocosim
-make simulink-kind2 KIND2=/path/to/kind2 Z3=/path/to/z3        # results/kind2-2019.jsonl
+make simulink-kind2 COCOSIM_KIND2=/path/to/kind2-v1.7.0 KIND2=/path/to/kind2 Z3=/path/to/z3   # results/kind2-2019.jsonl
 make simulink-sldv MATLAB=/path/to/matlab                       # results/sldv.jsonl
-make simulink-cocosim MATLAB=/path/to/matlab KIND2=... Z3=...   # results/cocosim.jsonl
+make simulink-cocosim MATLAB=/path/to/matlab COCOSIM_KIND2=/path/to/kind2-v1.7.0 Z3=...   # results/cocosim.jsonl
 make simulink-report                                 # all of them in results/simulink.md
 ```
 
