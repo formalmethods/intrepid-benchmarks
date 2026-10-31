@@ -1,0 +1,9 @@
+# the virtual environment of make setup
+/.venv/
+# the challenges, fetched at the pinned commit: never committed here
+/third_party/
+# the results of the runs, on the machine that ran them
+/results/
+# the encodings of lustre/harness.py
+/lustre/cache/
+__pycache__/

@@ -1,0 +1,5 @@
+# intrepyd with its Simulink translator; the design ranges and finite inputs
+# of the Simulink benchmark need 1.0.1 or newer
+intrepyd>=1.0.1
+# the plots of the reports; without it, the reports have none
+matplotlib

@@ -1,0 +1,32 @@
+# The tests of the harnesses, and a short run of each benchmark with intrepyd
+# from PyPI, to know that a fresh machine can run them
+name: check
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set up
+        run: make setup
+      - name: The tests of the harnesses
+        run: make check
+      - name: A short Lustre run
+        run: make lustre LUSTRE_TIMEOUT=5 FILTER='protocol/peterson_[1-4]'
+      - name: A short Simulink run
+        run: make simulink TIMEOUT=10 FILTER='Roll_Autopilot'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results/
