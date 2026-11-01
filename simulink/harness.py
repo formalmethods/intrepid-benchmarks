@@ -68,11 +68,13 @@ design, and, with matplotlib, the plots next to it.
 
 import argparse
 import datetime
+import fractions
 import functools
 import glob
 import html.parser
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import re
@@ -202,8 +204,11 @@ def machine():
     return info
 
 
-def check_model(suite, model, mode, timeout, emit):
-    """Translates a model in a mode and checks each target; emit(record) for each"""
+def check_model(suite, model, mode, timeout, emit, properties=None, memory=None):
+    """Translates a model in a mode and checks each target (of properties,
+    if given); emit(record) for each, with the inputs of the counterexample
+    of a property falsified; memory, if given, the gigabytes each engine
+    may use"""
     # Imported here: only the process that checks needs the native libraries
     import runpy  # pylint: disable=import-outside-toplevel
     import intrepyd  # pylint: disable=import-outside-toplevel
@@ -226,11 +231,18 @@ def check_model(suite, model, mode, timeout, emit):
     circuit = built['mk_instance'](ctx, 'top')
     circuit.mk_circuit()
     abstractions = getattr(circuit, 'abstractions', {})
-    prefix = model_name(model) + '/'
+    simulink_types = built.get('SIMULINK_TYPES', {})
     for name, target in circuit.targets.items():
-        portfolio = ctx.mk_portfolio()
+        if properties is not None and block_in_model(name, model_name(model)) not in properties:
+            continue
+        try:
+            portfolio = (ctx.mk_portfolio() if memory is None
+                         else ctx.mk_portfolio(memory_limit=int(memory * 1024 ** 3)))
+        except TypeError:
+            # an intrepyd without memory limits (1.0.1)
+            portfolio = ctx.mk_portfolio()
         portfolio.add_target(target)
-        record = dict(base, property=name[len(prefix):] if name.startswith(prefix) else name)
+        record = dict(base, property=block_in_model(name, model_name(model)))
         try:
             result = portfolio.reach_targets(timeout=timeout)
         except Exception as error:  # pylint: disable=broad-except
@@ -242,6 +254,7 @@ def check_model(suite, model, mode, timeout, emit):
             record['verdict'] = 'valid'
         elif result == EngineResult.REACHABLE:
             record['verdict'] = 'falsified'
+            record['counterexample'] = counterexample(portfolio.get_last_trace(), circuit, simulink_types)
             if abstractions:
                 # through a function abstracted as an input, the
                 # counterexample may be the abstraction's: replayed with the
@@ -251,7 +264,97 @@ def check_model(suite, model, mode, timeout, emit):
                     record['verdict'] = 'falsified, not confirmed'
         else:
             record['verdict'] = 'undecided'
+        errors = portfolio.get_last_errors()
+        if errors:
+            record['engine_errors'] = errors
+            if record['verdict'] == 'undecided' and set(errors) >= set(portfolio.engines):
+                # no engine ran to the end: not an answer
+                record.update(verdict='error', error='; '.join(f'{e}: {m}' for e, m in sorted(errors.items())))
+            out_of_memory = getattr(portfolio, 'get_last_out_of_memory', lambda: ())()
+            if out_of_memory:
+                record['out_of_memory'] = list(out_of_memory)
         emit(record)
+
+
+def trace_number(text):
+    """A value of an intrepyd trace as a python number: -3.0 is (- 3.0), a
+    rational (/ 1 3) or 1/3, a boolean T or F; None if it has none"""
+    text = text.strip()
+    if text.startswith('(- ') and text.endswith(')'):
+        value = trace_number(text[3:-1])
+        return None if value is None else -value
+    if text.startswith('(/ ') and text.endswith(')'):
+        parts = text[3:-1].split()
+        if len(parts) == 2:
+            a, b = trace_number(parts[0]), trace_number(parts[1])
+            return None if a is None or b is None else float(fractions.Fraction(a) / fractions.Fraction(b))
+    if text in ('T', 'true'):
+        return 1
+    if text in ('F', 'false'):
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(fractions.Fraction(text))
+    except (ValueError, ZeroDivisionError):
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def counterexample(trace, circuit, simulink_types):
+    """The values of the root Inports at each step of a trace, by name (a
+    vector's elements as name[i]); its inputs of the translation alone, an
+    abstraction's, left out. A value the trace leaves free (?) is 0, and
+    its input listed as free. A Simulink Inport takes finite values only: an
+    infinite or NaN value is 0 in inputs, and in specials, by name, a code
+    at each step: 0 the value of inputs, 1 +inf, 2 -inf, 3 NaN. Not
+    replayable if a value is not a number at all"""
+    steps = trace.get_max_depth() + 1
+    inputs = {}
+    specials = {}
+    free = []
+    replayable = True
+    for name, net in circuit.inputs.items():
+        if name not in simulink_types:
+            continue
+        values = []
+        codes = []
+        for step in range(steps):
+            text = trace.get_value(net, step)
+            value = trace_number(text)
+            code = 0
+            if text.strip() == '?':
+                value = 0
+                if name not in free:
+                    free.append(name)
+            elif value is None:
+                replayable = False
+            elif isinstance(value, float) and not math.isfinite(value):
+                code = 3 if math.isnan(value) else (1 if value > 0 else 2)
+                value = 0
+            values.append(value)
+            codes.append(code)
+        inputs[name] = values
+        if any(codes):
+            specials[name] = codes
+    example = {'steps': steps, 'inputs': inputs, 'replayable': replayable}
+    if specials:
+        example['specials'] = specials
+    if free:
+        example['free'] = free
+    return example
+
+
+def block_in_model(path, model):
+    """The path of a block without its model's name, as SLDV gives it: the
+    model's name may have a suffix (NLGuidance's root is its name and _tmp)"""
+    top, _, rest = path.partition('/')
+    return rest if rest and top.startswith(model) else path
 
 
 def read_jsonl(path):
@@ -279,6 +382,8 @@ def run_models(arguments, modes, info, check):
         if not read_jsonl(out_path):
             record = info()
             record.update(timeout=arguments.timeout, suite_commit=LM_COMMIT)
+            if getattr(arguments, 'memory', None):
+                record['memory_per_engine_gb'] = arguments.memory
             out.write(json.dumps(record) + '\n')
             out.flush()
 
@@ -312,19 +417,149 @@ def run(arguments):
 
     def check(suite, model, mode, emit):
         command = [sys.executable, os.path.abspath(__file__), 'check', model, mode,
-                   '--timeout', str(arguments.timeout), '--suite', suite]
-        # in a folder of its own: what the check leaves behind (intrepid
-        # writes trace.cpp where it meets an error) goes with it
+                   '--timeout', str(arguments.timeout), '--suite', suite, '--memory', str(arguments.memory)]
+        # in a folder of its own; intrepid writes trace.cpp where it meets an
+        # error, which is kept, next to the results, to find why
         scratch = tempfile.mkdtemp(prefix='simulink-check-')
         with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, cwd=scratch) as process:
             for line in process.stdout:
                 if line.startswith('{'):
                     emit(json.loads(line))
             status = process.wait()
+        trace = os.path.join(scratch, 'trace.cpp')
+        if os.path.exists(trace):
+            kept = os.path.join(os.path.dirname(os.path.abspath(arguments.out)),
+                                f'trace-{model_name(model)}-{mode}.cpp')
+            shutil.copyfile(trace, kept)
+            print(f'  intrepid met an error and wrote {kept}', flush=True)
+        if status != 0:
+            print(f'  the check exited with status {status}', flush=True)
         shutil.rmtree(scratch, ignore_errors=True)
         return status == 0
 
     run_models(arguments, modes, machine, check)
+
+
+# Replaying intrepid's counterexamples in Simulink
+
+def replay(arguments):
+    """Simulates in Simulink the counterexamples of intrepid's falsified
+    properties (found again, where the results lack them), and appends to
+    OUT whether each one's property fails there too: a record per
+    counterexample, of kind 'replay'"""
+    suite = os.path.abspath(arguments.suite)
+    paths = {model_name(m): m for m in models(suite)}
+    falsified = {}      # model -> [record]
+    for path in arguments.runs:
+        for record in read_jsonl(path):
+            if (record.get('kind') == 'result' and record.get('tool') == 'intrepid'
+                    and record.get('verdict') in ('falsified', 'falsified, not confirmed')
+                    and record['model'] in paths
+                    and not (arguments.filter and not re.search(arguments.filter, paths[record['model']]))):
+                falsified.setdefault(record['model'], []).append(record)
+    done = {(r['model'], r['mode'], r['property']) for r in read_jsonl(arguments.out) if r.get('kind') == 'replay'}
+    with open(arguments.out, 'a', encoding='utf-8') as out:
+        for model, records in sorted(falsified.items()):
+            records = [r for r in records if (model, r['mode'], r['property']) not in done]
+            if not records:
+                continue
+            print(f'{model}: {len(records)} counterexamples', flush=True)
+            records = with_counterexamples(suite, paths[model], records, arguments.timeout)
+            for record in replay_model(arguments, suite, paths[model], records):
+                out.write(json.dumps(record) + '\n')
+                out.flush()
+                print(f'  {record["property"]} ({record["mode"]}): {record["verdict"]}'
+                      + (f': {record["error"]}' if record.get('error') else ''), flush=True)
+
+
+def with_counterexamples(suite, model, records, timeout):
+    """The records, those without a counterexample with one found again by
+    intrepid (one process per mode); a record whose property is not
+    falsified again keeps none"""
+    found = {}
+    for mode in sorted({r['mode'] for r in records if not r.get('counterexample')}):
+        wanted = [r['property'] for r in records if r['mode'] == mode and not r.get('counterexample')]
+        command = [sys.executable, os.path.abspath(__file__), 'check', model, mode, '--timeout', str(timeout),
+                   '--suite', suite] + [a for p in wanted for a in ('--property', p)]
+        scratch = tempfile.mkdtemp(prefix='simulink-replay-')
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, cwd=scratch) as process:
+            for line in process.stdout:
+                if line.startswith('{'):
+                    again = json.loads(line)
+                    found[(mode, again['property'])] = again.get('counterexample')
+            process.wait()
+        if os.path.exists(os.path.join(scratch, 'trace.cpp')):
+            kept = os.path.join(ROOT, 'results', f'trace-replay-{model_name(model)}-{mode}.cpp')
+            shutil.copyfile(os.path.join(scratch, 'trace.cpp'), kept)
+            print(f'  intrepid met an error and wrote {kept}', flush=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+    return [dict(r, counterexample=r.get('counterexample') or found.get((r['mode'], r['property'])))
+            for r in records]
+
+
+def first_lines(text, count=2):
+    """The first lines of a MATLAB error report, on one line: where, then why"""
+    return ' '.join([line.strip() for line in text.strip().splitlines() if line.strip()][:count])
+
+
+def replay_model(arguments, suite, model, records):
+    """The replay records of the counterexamples of one model, simulated in
+    one MATLAB session"""
+    replays = []
+    cases = []
+    for i, record in enumerate(records):
+        base = {'kind': 'replay', 'tool': 'intrepid', 'mode': record['mode'], 'model': record['model'],
+                'property': record['property']}
+        example = record.get('counterexample')
+        if not example:
+            replays.append(dict(base, verdict='not replayed', error='no counterexample found again'))
+        elif not example.get('replayable', True):
+            replays.append(dict(base, verdict='not replayed', steps=example['steps'],
+                                error='a value of the counterexample is not a number'))
+        else:
+            case = {'id': i, 'property': record['property'], 'steps': example['steps'], 'inputs': example['inputs']}
+            if example.get('specials'):
+                case['specials'] = example['specials']
+            cases.append(case)
+            replays.append(dict(base, steps=example['steps']))
+    if not cases:
+        return replays
+    folder = tempfile.mkdtemp(prefix='simulink-replay-')
+    cases_path = os.path.join(folder, 'cases.json')
+    out = os.path.join(folder, 'replayed.json')
+    with open(cases_path, 'w', encoding='utf-8') as stream:
+        json.dump(cases, stream)
+    mats = '{' + ', '.join(matlab.matlab_string(m) for m in data_files(suite, model)) + '}'
+    statement = (f'replay_counterexamples({matlab.matlab_string(arguments.cocosim)}, '
+                 f'{matlab.matlab_string(os.path.join(suite, model))}, {mats}, '
+                 f'{matlab.matlab_string(cases_path)}, {matlab.matlab_string(out)})')
+    matlab.run_matlab(arguments.matlab, statement, folder, 600 + 60 * len(cases), os.path.join(folder, 'matlab.log'))
+    try:
+        with open(out, encoding='utf-8') as stream:
+            result = json.load(stream)
+    except (OSError, ValueError):
+        try:
+            with open(os.path.join(folder, 'matlab.log'), encoding='utf-8', errors='replace') as stream:
+                said = [line.strip() for line in stream if line.strip()][-3:]
+        except OSError:
+            said = []
+        result = {'error': 'MATLAB wrote no result' + (': ' + ' / '.join(said) if said else '')}
+    by_id = {c['id']: c for c in (result.get('cases') or [])} if isinstance(result.get('cases'), list) else {}
+    if isinstance(result.get('cases'), dict):
+        by_id = {result['cases']['id']: result['cases']}
+    for i, replayed in enumerate(replays):
+        if 'verdict' in replayed:
+            continue
+        case = by_id.get(i)
+        if case is None:
+            replayed.update(verdict='error', error=first_lines(result.get('error') or 'not simulated'))
+        elif case.get('error'):
+            replayed.update(verdict='error', error=first_lines(case['error']))
+        else:
+            replayed['simulink_step'] = case['step']
+            replayed['verdict'] = 'confirmed' if case['step'] >= 0 else 'not confirmed'
+    shutil.rmtree(folder, ignore_errors=True)
+    return replays
 
 
 # Running SLDV, CoCoSim and Kind2
@@ -545,10 +780,12 @@ def syntax_errors(folder):
             text = stream.read()
         # Kind2's XML output, as it is, in the HTML
         for match in re.finditer(r'<Log class="error"([^>]*)>(.*?)</Log>', text, re.DOTALL):
-            where = re.search(r'line="(\d+)" column="(\d+)" file="([^"]*)"', match.group(1))
+            where = re.search(r'line="(\d+)" column="(\d+)"(?: file="([^"<]*)")?', match.group(1))
             message = ' '.join(re.sub(r'<[^>]*>', ' ', match.group(2)).split())
             if where:
-                message = f'{os.path.basename(where.group(3))}:{where.group(1)}:{where.group(2)}: {message}'
+                # CoCoSim may have made the file a link: then the main Lustre file
+                name = os.path.basename(where.group(3)) if where.group(3) else 'the Lustre file'
+                message = f'{name}:{where.group(1)}:{where.group(2)}: {message}'
             errors.append(f'Kind2: {message}')
     return '; '.join(dict.fromkeys(errors))
 
@@ -841,7 +1078,8 @@ def cell(record):
         return '—'
     verdict = record['verdict']
     time = record.get('time')
-    if time is not None and verdict != 'unsupported':
+    # SLDV gives -1 for an objective it did not analyze
+    if time is not None and time >= 0 and verdict != 'unsupported':
         text = f'{verdict} ({time:.1f} s)' if time >= 1 else f'{verdict} ({time:.2f} s)'
     else:
         text = verdict
@@ -965,10 +1203,13 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
     unmatched = {}      # (model, mode) -> Kind2's properties with no SLDV block
     unsupported = {}    # (model, mode) -> error
     unsupported_designs = set()
+    replays = {}        # (model, property, mode) -> the replay of intrepid's counterexample
     for path in arguments.runs:
         info = None
         for record in read_jsonl(path):
-            if record.get('kind') == 'machine':
+            if record.get('kind') == 'replay':
+                replays[(record['model'], record['property'], record['mode'])] = record
+            elif record.get('kind') == 'machine':
                 info = info or record
             elif record.get('kind') == 'result':
                 infos.setdefault(record['mode'], info)
@@ -1003,7 +1244,9 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
         lines.append(f'- **Measured** on {info.get("date")}: {info.get("cpu")}, {info.get("cores")} threads, '
                      f'{info.get("memory_gb", "?")} GB, {info.get("platform")}; Python {info.get("python")}, '
                      f'intrepyd {info.get("intrepyd")}, Simulink translator {info.get("translator")}; '
-                     f'{info.get("timeout")} s per property ({tools})'
+                     f'{info.get("timeout")} s per property'
+                     + (f', {info["memory_per_engine_gb"]:g} GB per engine' if info.get('memory_per_engine_gb') else '')
+                     + f' ({tools})'
                      + ''.join(f'; {name} {info[name]}' for name in ('matlab', 'cocosim', 'kind2', 'z3')
                                if info.get(name)) + '.')
     for mode in modes:
@@ -1086,6 +1329,23 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
         lines += [f'| {m} | {p} | {", ".join(h)} | {", ".join(f)} |' for m, p, h, f in disagreements]
     else:
         lines.append('None.')
+    if replays:
+        lines += ['', "## intrepid's counterexamples in Simulink", '',
+                  "Each counterexample of intrepid, its inputs at each step given to the SLDV model simulated in "
+                  "Simulink (MATLAB R2018a, its Assertion blocks not stopping it): the first step at which the "
+                  "property block's input is false there, if any. With reals, a counterexample's values are "
+                  "rounded to doubles: it may legitimately not fail in Simulink.", '',
+                  "| Model | Property | Mode | intrepid: fails at step | Simulink |",
+                  '| ----- | -------- | ---- | ----------------------- | -------- |']
+        for (model, prop, mode), record in sorted(replays.items()):
+            if record['verdict'] == 'confirmed':
+                outcome = f'fails at step {record["simulink_step"]}'
+            elif record['verdict'] == 'not confirmed':
+                outcome = '**holds at every step**'
+            else:
+                outcome = f'{record["verdict"]}: {record.get("error", "")}'
+            last = record['steps'] - 1 if record.get('steps') else ''
+            lines.append(f'| {model} | {prop} | {MODE_TITLES.get(mode, mode)} | {last} | {outcome} |')
     lines += ['', '## CoCoSim and Kind2 (reported), per design', '',
               'All the properties of each result, those CoCoSim adds included (the contracts of its '
               'library blocks, whether the modes of a contract are exhaustive), with the timeout of '
@@ -1111,6 +1371,8 @@ def main():
     command.add_argument('--into', default=SUITE)
     command = commands.add_parser('run', help='run intrepid on the SLDV models')
     command.add_argument('out')
+    command.add_argument('--memory', type=float, default=8.0,
+                         help='gigabytes each engine may use (8: four engines in 32)')
     command.add_argument('--modes', default=','.join(DEFAULT_MODES), help=f'among {", ".join(MODES)}')
     command.add_argument('--timeout', type=float, default=120.0, help='seconds per property')
     command.add_argument('--filter', help='only the models whose path matches this regular expression')
@@ -1140,6 +1402,17 @@ def main():
     command.add_argument('mode', choices=MODES)
     command.add_argument('--timeout', type=float, default=120.0)
     command.add_argument('--suite', default=SUITE)
+    command.add_argument('--property', action='append', help='only this property (again for more)')
+    command.add_argument('--memory', type=float, help='gigabytes each engine may use')
+    command = commands.add_parser('replay', help="replay intrepid's counterexamples in Simulink (MATLAB)")
+    command.add_argument('runs', nargs='+', help='the results of intrepid')
+    command.add_argument('--out', required=True, help='where the replays go, JSON lines')
+    command.add_argument('--matlab', required=True, help='the MATLAB executable (or its launcher)')
+    command.add_argument('--cocosim', default=matlab.COCOSIM, help='CoCoSim, set up by fetch-cocosim')
+    command.add_argument('--timeout', type=float, default=120.0,
+                         help='seconds per property, to find again a counterexample the results lack')
+    command.add_argument('--filter', help='only the models whose path matches this regular expression')
+    command.add_argument('--suite', default=SUITE)
     command = commands.add_parser('reported', help='read the results the suite reports')
     command.add_argument('out')
     command.add_argument('--suite', default=SUITE)
@@ -1163,7 +1436,11 @@ def main():
         {'sldv': sldv, 'cocosim': cocosim, 'kind2': kind2_2019}[arguments.command](arguments)
     elif arguments.command == 'check':
         check_model(arguments.suite, arguments.model, arguments.mode, arguments.timeout,
-                    lambda record: print(json.dumps(record), flush=True))
+                    lambda record: print(json.dumps(record), flush=True), arguments.property, arguments.memory)
+    elif arguments.command == 'replay':
+        for name in ('cocosim', 'out'):
+            setattr(arguments, name, os.path.abspath(getattr(arguments, name)))
+        replay(arguments)
     elif arguments.command == 'reported':
         reported(arguments)
     else:

@@ -87,6 +87,21 @@ not reached then.
 A model the translator does not support counts its properties as
 `unsupported`, with the reason in the report.
 
+Each engine may use `MEMORY` gigabytes (8 by default, an intrepyd newer than
+1.0.1): beyond them it stops, and a property whose engines all stopped so is
+an `error`, out of memory, rather than `undecided`. With floats, z3 can take
+gigabytes in seconds on the larger models.
+
+**intrepid's counterexamples are replayed in Simulink** (`make
+simulink-replay MATLAB=...`): the inputs of each counterexample, step by step,
+given to the SLDV model simulated in MATLAB, its Assertion blocks not stopping
+it; the report says at which step the property's block sees false there, or
+that it never does. A counterexample found again where the results lack one.
+With floats, Simulink computes as IEEE does, and confirms intrepid; with reals,
+the values of a counterexample are rounded to doubles, and it may
+legitimately not fail. A counterexample whose inputs are NaN or infinite is
+not replayed: a root Inport takes only finite values.
+
 **SLDV and CoCoSim** run on the same SLDV models, on your machine, if you
 have MATLAB with Simulink Design Verifier (`make simulink-tools`):
 
@@ -158,6 +173,7 @@ make fetch-cocosim                                   # third_party/cocosim
 make simulink-kind2 COCOSIM_KIND2=/path/to/kind2-v1.7.0 KIND2=/path/to/kind2 Z3=/path/to/z3   # results/kind2-2019.jsonl
 make simulink-sldv MATLAB=/path/to/matlab                       # results/sldv.jsonl
 make simulink-cocosim MATLAB=/path/to/matlab COCOSIM_KIND2=/path/to/kind2-v1.7.0 Z3=...   # results/cocosim.jsonl
+make simulink-replay MATLAB=/path/to/matlab                     # results/replays.jsonl
 make simulink-report                                 # all of them in results/simulink.md
 ```
 
@@ -167,6 +183,7 @@ system needs for it): it is given MATLAB's options.
 The variables:
 
 - `TIMEOUT=300`: the seconds per property;
+- `MEMORY=16`: the gigabytes each engine of intrepid may use;
 - `MODES=float,real,float-finite,float-free`: the modes;
 - `FILTER=euler`: only the models whose path matches a regular expression;
 - `RESULTS=elsewhere`: the folder of the results.
@@ -209,8 +226,8 @@ version intrepid is built with.
 
 | Path | What |
 | ---- | ---- |
-| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `sldv`, `cocosim`, `kind2`, `reported`, `report` |
-| `simulink/matlab.py`, `simulink/matlab/` | CoCoSim's setup, and the MATLAB scripts of the SLDV and CoCoSim runs |
+| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `sldv`, `cocosim`, `kind2`, `replay`, `reported`, `report` |
+| `simulink/matlab.py`, `simulink/matlab/` | CoCoSim's setup, and the MATLAB scripts of the SLDV and CoCoSim runs and of the replays |
 | `lustre/harness.py`, `lustre/run_one.py` | The Lustre benchmark |
 | `lustre/kind2-benchmarks/` | The Kind2 benchmark suite |
 | `tests/` | The tests of the harnesses: `make check` |

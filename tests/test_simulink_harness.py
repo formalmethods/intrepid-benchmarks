@@ -153,6 +153,13 @@ class TestTools(unittest.TestCase):
                              harness.property_blocks(suite, model))
             self.assertEqual({}, harness.property_blocks(suite, model[:-4] + '.mdl'))
 
+    def test_the_paths_of_blocks_without_their_model(self):
+        self.assertEqual('contract/A3', harness.block_in_model('m_SLDV_tmp/contract/A3', 'm_SLDV'))
+        self.assertEqual('Spec/A1', harness.block_in_model('m_SLDV/Spec/A1', 'm_SLDV'))
+        self.assertEqual('Spec/A1', harness.block_in_model('Spec/A1', 'm_SLDV'))
+        # SLDV's time of an objective it did not analyze
+        self.assertEqual('undecided', harness.cell({'verdict': 'undecided', 'time': -1.0}))
+
     def test_the_errors_of_a_failed_syntax_check(self):
         with tempfile.TemporaryDirectory() as folder:
             report = os.path.join(folder, 'cocosim_output', 'm_PP', 'm_PP_error_messages.html')
@@ -297,6 +304,80 @@ class TestReport(unittest.TestCase):
         self.assertIn("properties naming no block of the SLDV model: `_one_mode_active` valid (0.10 s)", text)
         self.assertIn('SLDV 3.5 (R2018a)', text)
 
+
+
+class _Trace:
+    """A trace of intrepyd, of values written as intrepyd writes them"""
+
+    def __init__(self, values):
+        self.values = values
+
+    def get_max_depth(self):
+        return max(len(v) for v in self.values.values()) - 1
+
+    def get_value(self, net, step):
+        return self.values[net][step]
+
+
+class TestCounterexamples(unittest.TestCase):
+    """intrepid's counterexamples, kept to be replayed in Simulink"""
+
+    def test_trace_values(self):
+        self.assertEqual(-3.0, harness.trace_number('(- 3.0)'))
+        self.assertEqual(0.5, harness.trace_number('(/ 1 2)'))
+        self.assertEqual(-0.25, harness.trace_number('(- (/ 1 4))'))
+        self.assertEqual(1 / 3, harness.trace_number('1/3'))
+        self.assertEqual(1, harness.trace_number('T'))
+        self.assertEqual(0, harness.trace_number('F'))
+        self.assertEqual(-7, harness.trace_number('-7'))
+        self.assertTrue(harness.trace_number('nan') != harness.trace_number('nan'))
+        self.assertIsNone(harness.trace_number('?'))
+
+    def test_the_inputs_of_the_model_only(self):
+        circuit = SimpleNamespace(inputs={'u': 'u', 'v[1]': 'v1', 'sqrt(m/Root)': 'abstraction'})
+        trace = _Trace({'u': ['1.5', '(- 2.0)'], 'v1': ['T', 'F'], 'abstraction': ['3.0', '4.0']})
+        example = harness.counterexample(trace, circuit, {'u': 'double', 'v[1]': 'boolean', 'y': 'double'})
+        self.assertEqual({'steps': 2, 'inputs': {'u': [1.5, -2.0], 'v[1]': [1, 0]}, 'replayable': True}, example)
+        trace = _Trace({'u': ['?', '1.0'], 'v1': ['T', 'F'], 'abstraction': ['3.0', '4.0']})
+        example = harness.counterexample(trace, circuit, {'u': 'double', 'v[1]': 'boolean'})
+        self.assertEqual(([0, 1.0], ['u']), (example['inputs']['u'], example['free']))
+        trace = _Trace({'u': ['inf', '(- inf)', 'nan', '2.0'], 'v1': ['T', 'F', 'T', 'F'],
+                        'abstraction': ['3.0', '4.0', '5.0', '6.0']})
+        example = harness.counterexample(trace, circuit, {'u': 'double', 'v[1]': 'boolean'})
+        self.assertEqual(([0, 0, 0, 2.0], {'u': [1, 2, 3, 0]}), (example['inputs']['u'], example['specials']))
+        self.assertTrue(example['replayable'])
+        trace = _Trace({'u': ['what'], 'v1': ['T'], 'abstraction': ['3.0']})
+        self.assertFalse(harness.counterexample(trace, circuit, {'u': 'double', 'v[1]': 'boolean'})['replayable'])
+
+    def test_what_is_not_replayed(self):
+        records = [{'mode': 'float', 'model': 'm_SLDV', 'property': 'Spec/A1'},
+                   {'mode': 'real', 'model': 'm_SLDV', 'property': 'Spec/A2',
+                    'counterexample': {'steps': 1, 'inputs': {'u': [None]}, 'replayable': False}}]
+        replays = harness.replay_model(SimpleNamespace(), 'suite', 'm_SLDV.slx', records)
+        self.assertEqual(['not replayed', 'not replayed'], [r['verdict'] for r in replays])
+        self.assertIn('not a number', replays[1]['error'])
+
+    def test_the_replays_in_the_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = os.path.join(folder, 'run.jsonl')
+            records = [{'kind': 'machine', 'timeout': 1},
+                       {'kind': 'result', 'tool': 'intrepid', 'mode': 'float', 'model': 'm_SLDV', 'design': 'd',
+                        'property': 'Spec/A1', 'verdict': 'falsified', 'time': 0.1},
+                       {'kind': 'replay', 'tool': 'intrepid', 'mode': 'float', 'model': 'm_SLDV',
+                        'property': 'Spec/A1', 'steps': 3, 'simulink_step': 2, 'verdict': 'confirmed'},
+                       {'kind': 'replay', 'tool': 'intrepid', 'mode': 'real', 'model': 'm_SLDV',
+                        'property': 'Spec/A1', 'steps': 2, 'simulink_step': -1, 'verdict': 'not confirmed'}]
+            with open(run, 'w', encoding='utf-8') as out:
+                out.write('\n'.join(json.dumps(r) for r in records) + '\n')
+            reported = os.path.join(folder, 'reported.json')
+            with open(reported, 'w', encoding='utf-8') as out:
+                json.dump({'suite_commit': harness.LM_COMMIT, 'sldv': [], 'kind2': []}, out)
+            out = os.path.join(folder, 'report.md')
+            harness.report(SimpleNamespace(runs=[run], reported=reported, out=out))
+            with open(out, encoding='utf-8') as stream:
+                text = stream.read()
+        self.assertIn('| m_SLDV | Spec/A1 | intrepid, floats | 2 | fails at step 2 |', text)
+        self.assertIn('| m_SLDV | Spec/A1 | intrepid, reals | 1 | **holds at every step** |', text)
 
 if __name__ == '__main__':
     unittest.main()

@@ -5,6 +5,7 @@
 #   make simulink    the Simulink benchmark: fetch, run, the reported results, the report
 #   make simulink-tools  SLDV, CoCoSim and Kind2 measured too (MATLAB, KIND2, Z3), then the report
 #   make simulink-all    intrepid, SLDV, CoCoSim and Kind2, then the report
+#   make simulink-replay intrepid's counterexamples simulated in Simulink (MATLAB)
 #   make lustre      the Lustre benchmark: intrepyd's portfolio on the Kind2 suite, and its report
 
 PYTHON ?= .venv/bin/python
@@ -14,6 +15,8 @@ RESULTS ?= results
 # seconds per property, and the modes of intrepid (see simulink/harness.py)
 TIMEOUT ?= 120
 MODES ?= float,real
+# the gigabytes each engine of intrepid may use (intrepyd newer than 1.0.1)
+MEMORY ?= 8
 # a regular expression on the models' paths, to run some only
 FILTER ?=
 # the other tools of the Simulink benchmark: MATLAB with Simulink Design
@@ -32,7 +35,7 @@ COCOSIM_FALLBACK = $(if $(filter-out $(KIND2),$(COCOSIM_KIND2)),--fallback-kind2
 LUSTRE_TIMEOUT ?= 30
 LUSTRE_TOOLS ?= portfolio
 
-.PHONY: setup check fetch fetch-cocosim simulink simulink-run simulink-reported simulink-report \
+.PHONY: setup check fetch fetch-cocosim simulink simulink-run simulink-replay simulink-reported simulink-report \
 	simulink-tools simulink-all simulink-sldv simulink-cocosim simulink-kind2 lustre lustre-run lustre-report
 
 setup:
@@ -75,7 +78,12 @@ simulink-kind2:
 simulink-run:
 	@mkdir -p $(RESULTS)
 	$(PYTHON) simulink/harness.py run $(RESULTS)/simulink.jsonl --modes $(MODES) --timeout $(TIMEOUT) \
-		$(FILTER_OPTION)
+		--memory $(MEMORY) $(FILTER_OPTION)
+
+simulink-replay:
+	@mkdir -p $(RESULTS)
+	$(PYTHON) simulink/harness.py replay $(RESULTS)/simulink.jsonl --out $(RESULTS)/replays.jsonl \
+		--matlab '$(MATLAB)' --timeout $(TIMEOUT) $(FILTER_OPTION)
 
 simulink-reported:
 	@mkdir -p $(RESULTS)
@@ -83,7 +91,8 @@ simulink-reported:
 
 simulink-report:
 	$(PYTHON) simulink/harness.py report $(wildcard $(RESULTS)/simulink.jsonl $(RESULTS)/sldv.jsonl \
-		$(RESULTS)/cocosim.jsonl $(RESULTS)/kind2-2019.jsonl) --reported $(RESULTS)/reported.json \
+		$(RESULTS)/cocosim.jsonl $(RESULTS)/kind2-2019.jsonl $(RESULTS)/replays.jsonl) \
+		--reported $(RESULTS)/reported.json \
 		--out $(RESULTS)/simulink.md
 
 lustre: lustre-run lustre-report
