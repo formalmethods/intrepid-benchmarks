@@ -233,3 +233,12 @@ version intrepid is built with.
 | `tests/` | The tests of the harnesses: `make check` |
 | `third_party/` | The fetched suites and CoCoSim (not committed) |
 | `results/` | The results of the runs (not committed) |
+
+## License
+
+The harnesses, their tests and this documentation are under the MIT license
+([LICENSE](LICENSE)). `lustre/kind2-benchmarks/` is the Kind2 benchmark
+suite, under the terms of its authors. The suites fetched into
+`third_party/` (the Lockheed Martin challenges, CoCoSim) are not part of this
+repository and keep their own terms. intrepyd, which the harnesses run, has
+its own license, with a free non-commercial one.
