@@ -99,8 +99,11 @@ it; the report says at which step the property's block sees false there, or
 that it never does. A counterexample found again where the results lack one.
 With floats, Simulink computes as IEEE does, and confirms intrepid; with reals,
 the values of a counterexample are rounded to doubles, and it may
-legitimately not fail. A counterexample whose inputs are NaN or infinite is
-not replayed: a root Inport takes only finite values.
+legitimately not fail. An input that is NaN or infinite at a step is given
+as such. The report's disagreements (a property valid by one tool or mode,
+falsified by another) say for each whether intrepid's counterexample fails in
+Simulink too: then the property fails in the model as Simulink computes it,
+not in the translation alone.
 
 **SLDV and CoCoSim** run on the same SLDV models, on your machine, if you
 have MATLAB with Simulink Design Verifier (`make simulink-tools`):

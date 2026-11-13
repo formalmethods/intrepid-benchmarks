@@ -1324,9 +1324,20 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
     if disagreements:
         lines += ['A property valid by some and falsified by others. With floats, the IEEE semantics '
                   '(rounding, overflow, NaN) can falsify what holds of rationals; SLDV\'s "valid under '
-                  'approximation" may not hold exactly: each is to be explained.',
-                  '', '| Model | Property | Valid by | Falsified by |', '| ----- | -------- | -------- | ------------ |']
-        lines += [f'| {m} | {p} | {", ".join(h)} | {", ".join(f)} |' for m, p, h, f in disagreements]
+                  'approximation" may not hold exactly: each is to be explained. The last column says whether '
+                  'intrepid\'s counterexample fails in Simulink too (see below): if it does, the property '
+                  'fails in the model as Simulink computes it, not in the translation alone.',
+                  '', '| Model | Property | Valid by | Falsified by | In Simulink |',
+                  '| ----- | -------- | -------- | ------------ | ----------- |']
+        titled = {title: mode for mode, title in MODE_TITLES.items()}
+        for m, p, h, f in disagreements:
+            seen = []
+            for title in f:
+                record = replays.get((m, p, titled.get(title)))
+                if record is not None:
+                    seen.append(f'{title}: ' + (f'fails at step {record["simulink_step"]}'
+                                                if record['verdict'] == 'confirmed' else record['verdict']))
+            lines.append(f'| {m} | {p} | {", ".join(h)} | {", ".join(f)} | {"; ".join(seen) or "not replayed"} |')
     else:
         lines.append('None.')
     if replays:

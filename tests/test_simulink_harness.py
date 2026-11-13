@@ -363,6 +363,8 @@ class TestCounterexamples(unittest.TestCase):
             records = [{'kind': 'machine', 'timeout': 1},
                        {'kind': 'result', 'tool': 'intrepid', 'mode': 'float', 'model': 'm_SLDV', 'design': 'd',
                         'property': 'Spec/A1', 'verdict': 'falsified', 'time': 0.1},
+                       {'kind': 'result', 'tool': 'intrepid', 'mode': 'real', 'model': 'm_SLDV', 'design': 'd',
+                        'property': 'Spec/A1', 'verdict': 'valid', 'time': 0.1},
                        {'kind': 'replay', 'tool': 'intrepid', 'mode': 'float', 'model': 'm_SLDV',
                         'property': 'Spec/A1', 'steps': 3, 'simulink_step': 2, 'verdict': 'confirmed'},
                        {'kind': 'replay', 'tool': 'intrepid', 'mode': 'real', 'model': 'm_SLDV',
@@ -378,6 +380,9 @@ class TestCounterexamples(unittest.TestCase):
                 text = stream.read()
         self.assertIn('| m_SLDV | Spec/A1 | intrepid, floats | 2 | fails at step 2 |', text)
         self.assertIn('| m_SLDV | Spec/A1 | intrepid, reals | 1 | **holds at every step** |', text)
+        # the disagreement, with what Simulink says of the counterexample that falsifies it
+        self.assertIn('| m_SLDV | Spec/A1 | intrepid, reals | intrepid, floats | intrepid, floats: fails at step 2 |',
+                      text)
 
 if __name__ == '__main__':
     unittest.main()
