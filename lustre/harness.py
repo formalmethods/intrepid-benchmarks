@@ -151,8 +151,17 @@ def worker(arguments):
         if result == EngineResult.UNKNOWN and errors and len(errors) == len(portfolio.ENGINES):
             raise RuntimeError('; '.join('%s: %s' % item for item in sorted(errors.items())))
     else:
-        result, _, depth = portfolio._RUNNERS[arguments.tool](  # pylint: disable=protected-access
-            context, [target], None)
+        # One engine, as the portfolio runs it: a portfolio of that engine
+        # alone, with no memory limit of its own, as the harness limits this
+        # process already
+        engines = context.mk_portfolio(engines=[arguments.tool], memory_limit=None)
+        engines.add_target(target)
+        result = engines.reach_targets(timeout=arguments.timeout)
+        errors = engines.get_last_errors()
+        if result == EngineResult.UNKNOWN and errors:
+            raise RuntimeError('; '.join('%s: %s' % item for item in sorted(errors.items())))
+        if result == EngineResult.REACHABLE:
+            depth = engines.get_last_trace().get_max_depth()
     verdict = {EngineResult.REACHABLE: 'Invalid', EngineResult.UNREACHABLE: 'Valid'}.get(result, 'Unknown')
     print(json.dumps({'verdict': verdict, 'engine': engine, 'depth': depth}))
 
