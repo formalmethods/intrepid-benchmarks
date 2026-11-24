@@ -384,5 +384,123 @@ class TestCounterexamples(unittest.TestCase):
         self.assertIn('| m_SLDV | Spec/A1 | intrepid, reals | intrepid, floats | intrepid, floats: fails at step 2 |',
                       text)
 
+
+ESBMC_FAILED = """ESBMC version 8.8.0 64-bit x86_64 linux
+Violated property:
+  file ert_main.c line 88 column 13 function main
+  RM-001: PC should increment or fault should be detected
+  (_Bool)(rtDW.Delay1_DSTATE[0] > prev_fc)
+
+
+VERIFICATION FAILED
+
+Bug found (k = 1)
+"""
+
+
+class TestSpecVerify(unittest.TestCase):
+    """SpecVerify's assertions, checked by ESBMC, on the blocks of their requirements"""
+
+    def test_the_requirements_of_blocks(self):
+        self.assertEqual(('tsm', 3), harness.requirement_number('TSM-003b'))
+        self.assertEqual(('reg', 10), harness.requirement_number('REG0010'))
+        self.assertEqual(('reg', 1), harness.requirement_number('REG001'))
+        self.assertEqual(('eul', 1), harness.requirement_number('EUL001_1'))
+        self.assertEqual(('nn', 3), harness.requirement_number('NN03A'))
+        self.assertIsNone(harness.requirement_number('guarantee'))
+        self.assertEqual((4, 'A'), harness.specverify_number('4A'))
+        self.assertEqual((10, ''), harness.specverify_number('10'))
+
+    def test_the_properties_of_a_problem(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for name, text in (('ert_main.c', 'int main() {\n#ifdef VERIFY_PROPERTY_10\n#endif\n'
+                                              '  #ifdef VERIFY_PROPERTY_2\n#elif defined(VERIFY_PROPERTY_4B)\n'
+                                              '#if defined VERIFY_PROPERTY_4A\n}\n'),
+                               ('m.c', 'void m_step(void) {}\n'),
+                               ('test_case.c', 'int main() {\n#ifdef VERIFY_PROPERTY_99\n#endif\n}\n')):
+                with open(os.path.join(folder, name), 'w', encoding='utf-8') as out:
+                    out.write(text)
+            sources = harness.specverify_sources(folder)
+            self.assertEqual(['ert_main.c', 'm.c'], [os.path.basename(s) for s in sources])
+            self.assertEqual(['2', '4A', '4B', '10'], harness.specverify_properties(sources))
+
+    def test_the_blocks_of_a_requirement(self):
+        with tempfile.TemporaryDirectory() as suite:
+            model = os.path.join('FRET_CoCoSim', '9_euler', 'SLDV', 'm_SLDV.slx')
+            os.makedirs(os.path.join(suite, os.path.dirname(model)))
+            with zipfile.ZipFile(os.path.join(suite, model), 'w') as archive:
+                archive.writestr('simulink/blockdiagram.xml', BLOCK_DIAGRAM)
+            # Assertion1, of AP-003A, is not of the problem's requirements
+            self.assertEqual({2: [['m_SLDV', 'Spec/EUL_002_1']]}, harness.specverify_blocks(suite, '9_euler'))
+
+    def test_esbmc_verdicts(self):
+        self.assertEqual(('falsified', 'RM-001: PC should increment or fault should be detected', None),
+                         harness.parse_esbmc(ESBMC_FAILED))
+        self.assertEqual(('valid', None, None), harness.parse_esbmc('...\nVERIFICATION SUCCESSFUL\n'))
+        self.assertEqual(('undecided', None, None), harness.parse_esbmc('Solving\nERROR: Timed out\n'))
+        verdict, _, error = harness.parse_esbmc('m.c:3: error: unknown type name\nERROR: PARSING ERROR\n')
+        self.assertEqual('error', verdict)
+        self.assertIn('unknown type name', error)
+
+    def test_the_verdicts_specverify_reports(self):
+        with tempfile.TemporaryDirectory() as checkout:
+            folder = os.path.join(checkout, 'result', '2_tustin', 'LLM_code', 'Claude_code')
+            os.makedirs(folder)
+            with open(os.path.join(folder, 'ert_main.c'), 'w', encoding='utf-8') as out:
+                out.write('#ifdef VERIFY_PROPERTY_1\n#ifdef VERIFY_PROPERTY_4A\n#ifdef VERIFY_PROPERTY_4B\n')
+            with open(os.path.join(checkout, 'result', 'verification_summary.csv'), 'w', encoding='utf-8') as out:
+                out.write('Task,Attempt,Property_1,Property_2,Property_3,Property_4\n'
+                          '2_tustin,ChatGPT_code,FAILED,FAILED,FAILED,N/A\n'
+                          '2_tustin,Claude_code,SUCCESSFUL,TIMEOUT,FAILED,N/A\n')
+            self.assertEqual([('1', 'valid'), ('4A', 'undecided'), ('4B', 'falsified')],
+                             [(r['property'], r['verdict']) for r in harness.specverify_reported(checkout)])
+
+    def test_specverify_in_the_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            machine = {'kind': 'machine', 'date': '2026-11-24T10:00:00', 'cpu': 'a cpu', 'cores': 8,
+                       'memory_gb': 16, 'platform': 'Linux', 'timeout': 120}
+            base = {'kind': 'specverify', 'tool': 'specverify', 'mode': 'specverify', 'design': '0_triplex',
+                    'esbmc': '8.8.0'}
+            runs = {
+                'intrepid.jsonl': [machine,
+                                   {'kind': 'result', 'tool': 'intrepid', 'mode': 'real', 'model': 'm_SLDV',
+                                    'design': '0_triplex', 'property': 'Spec/A1', 'verdict': 'valid', 'time': 0.2},
+                                   {'kind': 'result', 'tool': 'intrepid', 'mode': 'real', 'model': 'm_SLDV',
+                                    'design': '0_triplex', 'property': 'Spec/A2', 'verdict': 'valid', 'time': 0.2}],
+                'specverify.jsonl': [dict(machine, esbmc='8.8.0', specverify=harness.SPECVERIFY_COMMIT),
+                                     dict(base, property='1', requirement='TSM-001', verdict='falsified',
+                                          time=0.16, violated='RM-001: PC should increment',
+                                          blocks=[['m_SLDV', 'Spec/A1'], ['m_SLDV', 'Spec/A2']]),
+                                     dict(base, property='4A', requirement='TSM-004A', verdict='valid', time=1.5,
+                                          blocks=[])],
+            }
+            paths = []
+            for name, records in runs.items():
+                paths.append(os.path.join(folder, name))
+                with open(paths[-1], 'w', encoding='utf-8') as out:
+                    out.write('\n'.join(json.dumps(r) for r in records) + '\n')
+            reported = os.path.join(folder, 'reported.json')
+            with open(reported, 'w', encoding='utf-8') as out:
+                json.dump({'suite_commit': harness.LM_COMMIT, 'sldv': [], 'kind2': [],
+                           'specverify': [{'design': '0_triplex', 'property': '1', 'status': 'FAILED',
+                                           'verdict': 'falsified'}]}, out)
+            out = os.path.join(folder, 'report.md')
+            harness.report(SimpleNamespace(runs=paths, reported=reported, out=out))
+            with open(out, encoding='utf-8') as stream:
+                text = stream.read()
+        # the property on each block of its requirement
+        self.assertIn('| Spec/A1 | — | valid (0.20 s) | falsified (0.16 s) |', text)
+        self.assertIn('| Spec/A2 | — | valid (0.20 s) | falsified (0.16 s) |', text)
+        self.assertIn("| SpecVerify (Claude's assertions, ESBMC), measured | 0 | 0 | 2 | 0 | 0 | 0 | 0 |", text)
+        # its own reading of the requirement: not a disagreement
+        self.assertIn('## Disagreements\n\nNone.', text)
+        self.assertIn('| 0_triplex | 1 | TSM-001 | falsified (0.16 s): RM-001: PC should increment | '
+                      'falsified (FAILED) | m_SLDV: Spec/A1, m_SLDV: Spec/A2 |', text)
+        self.assertIn('| 0_triplex | 4A | TSM-004A | valid (1.5 s) | — | none |', text)
+        self.assertIn('| measured | 1 | 0 | 1 | 0 | 0 | 0 | 0 |', text)
+        self.assertIn('| reported | 0 | 0 | 1 | 0 | 0 | 0 | 0 |', text)
+        self.assertIn('ESBMC 8.8.0', text)
+
+
 if __name__ == '__main__':
     unittest.main()

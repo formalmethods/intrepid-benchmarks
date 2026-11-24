@@ -3,9 +3,10 @@
 #   make setup       a virtual environment, .venv, with intrepyd and matplotlib
 #   make check       the tests of the harnesses (neither intrepyd nor the suites needed)
 #   make simulink    the Simulink benchmark: fetch, run, the reported results, the report
-#   make simulink-tools  SLDV, CoCoSim and Kind2 measured too (MATLAB, KIND2, Z3), then the report
-#   make simulink-all    intrepid, SLDV, CoCoSim and Kind2, then the report
+#   make simulink-tools  SLDV, CoCoSim, Kind2 and SpecVerify measured too (MATLAB, KIND2, Z3, ESBMC), then the report
+#   make simulink-all    intrepid, SLDV, CoCoSim, Kind2 and SpecVerify, then the report
 #   make simulink-replay intrepid's counterexamples simulated in Simulink (MATLAB)
+#   make simulink-specverify  SpecVerify's assertions checked by ESBMC (ESBMC), then the report
 #   make lustre      the Lustre benchmark: intrepyd's portfolio on the Kind2 suite, and its report
 
 PYTHON ?= .venv/bin/python
@@ -29,14 +30,17 @@ Z3 ?= z3
 # ones reject its library); the models whose Lustre it rejects are retried
 # with KIND2
 COCOSIM_KIND2 ?= $(KIND2)
+# ESBMC, for SpecVerify's assertions
+ESBMC ?= esbmc
 COCOSIM_FALLBACK = $(if $(filter-out $(KIND2),$(COCOSIM_KIND2)),--fallback-kind2 '$(KIND2)')
 # the Lustre benchmark: seconds per model, and the tools (kind2 and its
 # variants need KIND2, the Kind2 executable)
 LUSTRE_TIMEOUT ?= 30
 LUSTRE_TOOLS ?= portfolio
 
-.PHONY: setup check fetch fetch-cocosim simulink simulink-run simulink-replay simulink-reported simulink-report \
-	simulink-tools simulink-all simulink-sldv simulink-cocosim simulink-kind2 lustre lustre-run lustre-report
+.PHONY: setup check fetch fetch-cocosim fetch-specverify simulink simulink-run simulink-replay simulink-reported \
+	simulink-report simulink-tools simulink-all simulink-sldv simulink-cocosim simulink-kind2 simulink-specverify \
+	simulink-specverify-run lustre lustre-run lustre-report
 
 setup:
 	python3 -m venv .venv
@@ -52,12 +56,16 @@ fetch:
 fetch-cocosim:
 	$(PYTHON) simulink/harness.py fetch-cocosim
 
+fetch-specverify:
+	$(PYTHON) simulink/harness.py fetch-specverify
+
 simulink: fetch simulink-run simulink-reported simulink-report
 
-simulink-all: fetch fetch-cocosim simulink-run simulink-kind2 simulink-sldv simulink-cocosim simulink-reported \
-	simulink-report
+simulink-all: fetch fetch-cocosim fetch-specverify simulink-run simulink-kind2 simulink-sldv simulink-cocosim \
+	simulink-specverify-run simulink-reported simulink-report
 
-simulink-tools: fetch fetch-cocosim simulink-kind2 simulink-sldv simulink-cocosim simulink-reported simulink-report
+simulink-tools: fetch fetch-cocosim fetch-specverify simulink-kind2 simulink-sldv simulink-cocosim \
+	simulink-specverify-run simulink-reported simulink-report
 
 FILTER_OPTION = $(if $(FILTER),--filter '$(FILTER)',)
 
@@ -75,6 +83,13 @@ simulink-kind2:
 	$(PYTHON) simulink/harness.py kind2 $(RESULTS)/kind2-2019.jsonl --kind2 '$(COCOSIM_KIND2)' --z3 '$(Z3)' \
 		--timeout $(TIMEOUT) $(COCOSIM_FALLBACK) $(FILTER_OPTION)
 
+simulink-specverify: fetch fetch-specverify simulink-specverify-run simulink-reported simulink-report
+
+simulink-specverify-run:
+	@mkdir -p $(RESULTS)
+	$(PYTHON) simulink/harness.py specverify $(RESULTS)/specverify.jsonl --esbmc '$(ESBMC)' --timeout $(TIMEOUT) \
+		--memory $(MEMORY) $(FILTER_OPTION)
+
 simulink-run:
 	@mkdir -p $(RESULTS)
 	$(PYTHON) simulink/harness.py run $(RESULTS)/simulink.jsonl --modes $(MODES) --timeout $(TIMEOUT) \
@@ -91,7 +106,7 @@ simulink-reported:
 
 simulink-report:
 	$(PYTHON) simulink/harness.py report $(wildcard $(RESULTS)/simulink.jsonl $(RESULTS)/sldv.jsonl \
-		$(RESULTS)/cocosim.jsonl $(RESULTS)/kind2-2019.jsonl $(RESULTS)/replays.jsonl) \
+		$(RESULTS)/cocosim.jsonl $(RESULTS)/kind2-2019.jsonl $(RESULTS)/specverify.jsonl $(RESULTS)/replays.jsonl) \
 		--reported $(RESULTS)/reported.json \
 		--out $(RESULTS)/simulink.md
 

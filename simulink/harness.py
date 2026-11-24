@@ -12,7 +12,10 @@ NASA formalized them (https://github.com/hbourbouh/lm_challenges).
         --z3 Z3 [--timeout 120] ...
     python simulink/harness.py kind2 OUT.jsonl --kind2 KIND2 --z3 Z3
         [--timeout 120] ...
-    python simulink/harness.py reported OUT.json [--suite PATH]
+    python simulink/harness.py fetch-specverify [--into third_party/specverify]
+    python simulink/harness.py specverify OUT.jsonl --esbmc ESBMC [--timeout 120]
+        [--memory 8] ...
+    python simulink/harness.py reported OUT.json [--suite PATH] [--specverify PATH]
     python simulink/harness.py report OUT.jsonl... --reported REPORTED.json
         [--out results/report.md]
 
@@ -50,11 +53,22 @@ SLDV models, one model at a time, each into its OUT (and resumable as run):
   of contracts: each is given the block of the SLDV model it names, when
   one does (requirement_key).
 
+specverify runs ESBMC on the assertions of SpecVerify (Wang, Farrell,
+Cordeiro, Zhao, RE 2025; fetch-specverify clones it): the C code of each
+problem, generated from its model, with the assertions Claude 3.5 Sonnet
+wrote for its requirements, one property (VERIFY_PROPERTY_N, the requirement
+N) at a time, with --k-induction, as SpecVerify ran it. The assertions are
+the LLM's reading of the requirements, not the SLDV blocks: each property is
+given the blocks of the SLDV models named after its requirement
+(specverify_blocks), and the report lists them per requirement too, with the
+verdicts SpecVerify reports.
+
 SLDV and Kind2 have a time limit for the whole analysis of a model: they are
 given --timeout times the number of properties of the model, what intrepid
 would take at most.
 
-reported reads the results that the suite reports: SLDV's reports
+reported reads the results that the suite reports (and SpecVerify's, in
+result/verification_summary.csv, if it was fetched): SLDV's reports
 (FRET_CoCoSim/*/SLDV/sldv_output/*/*_report*.html, from 2019) and Kind2's on
 CoCoSim's Lustre (FRET_CoCoSim/*/CoCoSim/cocosim_output/**/*.xml). They were
 made on another machine, with versions of their own: their times are not
@@ -67,6 +81,7 @@ design, and, with matplotlib, the plots next to it.
 """
 
 import argparse
+import csv
 import datetime
 import fractions
 import functools
@@ -94,6 +109,18 @@ SUITE = os.path.join(ROOT, 'third_party', 'lm_challenges')
 LM_URL = 'https://github.com/hbourbouh/lm_challenges.git'
 # "export Models to R2017b", 2020-02-11
 LM_COMMIT = '133447a8943721eaa1d16acf1ba5845b67a98df1'
+# SpecVerify (Wang, Farrell, Cordeiro, Zhao, RE 2025): the C code of the
+# challenges, with the assertions an LLM wrote for their requirements
+SPECVERIFY = os.path.join(ROOT, 'third_party', 'specverify')
+SPECVERIFY_URL = 'https://github.com/LLM-ReqVerif/LLM-ReqVerif.git'
+# "Update README.md", 2025-09-19
+SPECVERIFY_COMMIT = '30ec5ce1381dacf3fc9ef5b0d25422cb6ac48846'
+# the LLM whose assertions are checked: SpecVerify is Claude 3.5 Sonnet with ESBMC
+SPECVERIFY_LLM = 'Claude_code'
+# a problem of SpecVerify -> the prefix of the names of its requirements in
+# the SLDV models (the requirement N of a problem is its property N)
+SPECVERIFY_PREFIXES = {'0_triplex': 'TSM', '1_fsm': 'FSM', '2_tustin': 'TUI', '3_regulators': 'REG',
+                       '4_nlguide': 'NLG', '5_nn': 'NN', '6_eb': 'EB', '8_swim': 'SWIM', '9_euler': 'EUL'}
 
 # mode -> the options of intrepyd.simulink.translate_file
 MODES = {
@@ -114,6 +141,7 @@ TOOL_TITLES = {
     'sldv': 'SLDV, measured',
     'cocosim': 'CoCoSim and Kind2, measured',
     'kind2-2019': "Kind2 on CoCoSim's Lustre of 2019, measured",
+    'specverify': "SpecVerify (Claude's assertions, ESBMC), measured",
 }
 MODE_TITLES.update(TOOL_TITLES)
 # The verdicts, in the order of the report's totals
@@ -123,21 +151,21 @@ VERDICTS = ('valid', 'valid under approximation', 'falsified', 'falsified, not c
 
 # The suite
 
-def fetch(into):
-    """Clones the challenges at LM_COMMIT into into, or checks that it is there"""
+def fetch(into, url=LM_URL, commit=LM_COMMIT):
+    """Clones url (the challenges) at commit into into, or checks that it is there"""
     if os.path.isdir(os.path.join(into, '.git')):
         head = subprocess.run(['git', '-C', into, 'rev-parse', 'HEAD'], check=True,
                               capture_output=True, text=True).stdout.strip()
-        if head == LM_COMMIT:
-            print(f'{into}: at {LM_COMMIT[:7]} already')
+        if head == commit:
+            print(f'{into}: at {commit[:7]} already')
             return
-        raise SystemExit(f'{into} is at {head[:7]}, not {LM_COMMIT[:7]}: remove it, or check out {LM_COMMIT}')
+        raise SystemExit(f'{into} is at {head[:7]}, not {commit[:7]}: remove it, or check out {commit}')
     os.makedirs(into, exist_ok=True)
-    for command in (['init', '-q'], ['remote', 'add', 'origin', LM_URL],
-                    ['fetch', '-q', '--depth', '1', 'origin', LM_COMMIT],
+    for command in (['init', '-q'], ['remote', 'add', 'origin', url],
+                    ['fetch', '-q', '--depth', '1', 'origin', commit],
                     ['checkout', '-q', 'FETCH_HEAD']):
         subprocess.run(['git', '-C', into] + command, check=True)
-    print(f'{into}: {LM_URL} at {LM_COMMIT[:7]}')
+    print(f'{into}: {url} at {commit[:7]}')
 
 
 def models(suite):
@@ -929,6 +957,191 @@ def kind2_2019(arguments):
                                 if arguments.fallback_kind2 else {})), check)
 
 
+# Running SpecVerify
+
+def specverify_problems(checkout):
+    """The problems of SpecVerify's checkout, in order: those of SPECVERIFY_PREFIXES with the
+    assertions of SPECVERIFY_LLM"""
+    return [design for design in sorted(SPECVERIFY_PREFIXES)
+            if os.path.isdir(os.path.join(checkout, 'result', design, 'LLM_code', SPECVERIFY_LLM))]
+
+
+def specverify_sources(folder):
+    """The C files of a problem's folder that make its program: ert_main.c, with the
+    assertions, and the code; not the tests next to them, each a main of its own"""
+    sources = []
+    for path in sorted(glob.glob(os.path.join(folder, '*.c'))):
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            text = stream.read()
+        if os.path.basename(path) == 'ert_main.c' or not re.search(r'\b(int|void)\s+main\s*\(', text):
+            sources.append(path)
+    return sources
+
+
+def specverify_number(prop):
+    """4A -> (4, 'A'): the requirement a property of SpecVerify checks, and which of its subtests"""
+    match = re.match(r'(\d+)(\w*)$', prop)
+    return (int(match.group(1)), match.group(2)) if match else (math.inf, prop)
+
+
+def specverify_properties(sources):
+    """The properties of SpecVerify in sources, the N of their VERIFY_PROPERTY_N, in order"""
+    found = set()
+    for path in sources:
+        with open(path, encoding='utf-8', errors='replace') as stream:
+            # in the conditions of the preprocessor: #ifdef, #if defined, #elif defined
+            found.update(re.findall(r'^\s*#\s*(?:el)?if.*?\bVERIFY_PROPERTY_(\w+)', stream.read(), re.M))
+    return sorted(found, key=specverify_number)
+
+
+def requirement_number(name):
+    """('tsm', 3) of TSM-003b, ('reg', 10) of REG0010, ('eul', 1) of EUL001_1; None of a
+    name without one, as Assertion or guarantee"""
+    match = re.match(r'([a-z]+)[^a-z0-9]*(\d+)', name.lower())
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def specverify_blocks(suite, design):
+    """requirement N -> the (model, block) of the SLDV models of a problem named after the
+    requirement N (TSM-003 -> the blocks of TSM-003a, TSM-003b, TSM-003c)"""
+    prefix = SPECVERIFY_PREFIXES[design].lower()
+    found = {}
+    for model in models(suite):
+        if design_of(model) != design:
+            continue
+        for path, names in property_blocks(suite, model).items():
+            for name in names:
+                number = requirement_number(name)
+                if number and number[0] == prefix:
+                    found.setdefault(number[1], []).append([model_name(model), path])
+                    break
+    return found
+
+
+def esbmc_version(esbmc):
+    try:
+        output = subprocess.run([esbmc, '--version'], capture_output=True, text=True, check=False,
+                                timeout=60).stdout.strip()
+    except OSError as error:
+        return f'not available: {error}'
+    match = re.search(r'ESBMC version (\S+)', output)
+    return match.group(1) if match else output
+
+
+def parse_esbmc(output):
+    """The verdict of ESBMC's output, the message of the property it found violated, and its
+    error, if it gave no verdict"""
+    if 'VERIFICATION SUCCESSFUL' in output:
+        return 'valid', None, None
+    if 'VERIFICATION FAILED' in output:
+        # the location, then the message of the assertion (or of a check of ESBMC's own)
+        match = re.search(r'Violated property:\n\s*file [^\n]*\n\s*([^\n]+)', output)
+        return 'falsified', match.group(1).strip() if match else None, None
+    if re.search(r'ERROR: Timed out|VERIFICATION UNKNOWN', output):
+        return 'undecided', None, None
+    errors = [line.strip() for line in output.splitlines() if 'ERROR' in line or 'error:' in line]
+    return 'error', None, '; '.join(errors[:3]) or first_lines(output.strip()[-500:]) or 'no verdict'
+
+
+def run_esbmc(esbmc, sources, includes, prop, seconds, memory):
+    """ESBMC on sources with VERIFY_PROPERTY_prop defined, as SpecVerify runs it (k-induction),
+    within seconds and memory gigabytes; its verdict, the violated property, its error, and
+    the seconds it took"""
+    command = [esbmc] + sources + [a for include in includes for a in ('-I', include)] + [
+        '--k-induction', '--memlimit', f'{memory:g}g', '--timeout', f'{int(seconds)}s',
+        f'-DVERIFY_PROPERTY_{prop}']
+    with tempfile.TemporaryDirectory(prefix='esbmc-') as folder:
+        started = datetime.datetime.now()
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=folder,
+                              start_new_session=True) as process:
+            try:
+                output, _ = process.communicate(timeout=seconds + 60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                return 'undecided', None, None, round(seconds + 60, 3)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        took = (datetime.datetime.now() - started).total_seconds()
+    verdict, violated, error = parse_esbmc(output)
+    return verdict, violated, error, round(took, 3)
+
+
+def specverify(arguments):
+    """Runs ESBMC on the assertions of SpecVerify, property by property, of every problem not
+    in OUT yet; each property is a record of kind specverify, with the SLDV blocks of its
+    requirement"""
+    suite = os.path.abspath(arguments.suite)
+    checkout = os.path.abspath(arguments.specverify)
+    if not os.path.isdir(os.path.join(checkout, 'result')):
+        raise SystemExit(f'no SpecVerify in {checkout}: run "python simulink/harness.py fetch-specverify" first')
+    if not os.path.isdir(os.path.join(suite, 'FRET_CoCoSim')):
+        raise SystemExit(f'no suite in {suite}: run "python simulink/harness.py fetch" first')
+    out_path = os.path.abspath(arguments.out)
+    version = esbmc_version(arguments.esbmc)
+    done = {r['model'] for r in read_jsonl(out_path) if r.get('kind') == 'done'}
+    with open(out_path, 'a', encoding='utf-8') as out:
+        if not read_jsonl(out_path):
+            record = machine()
+            record.update(timeout=arguments.timeout, suite_commit=LM_COMMIT, specverify=SPECVERIFY_COMMIT,
+                          esbmc=version, memory_per_engine_gb=arguments.memory)
+            out.write(json.dumps(record) + '\n')
+            out.flush()
+        for design in specverify_problems(checkout):
+            if design in done or (arguments.filter and not re.search(arguments.filter, design)):
+                continue
+            print(design, flush=True)
+            folder = os.path.join(checkout, 'result', design, 'LLM_code', SPECVERIFY_LLM)
+            sources = specverify_sources(folder)
+            blocks = specverify_blocks(suite, design)
+            for prop in specverify_properties(sources):
+                number, subtest = specverify_number(prop)
+                verdict, violated, error, took = run_esbmc(
+                    arguments.esbmc, sources, [folder, os.path.join(checkout, 'include')], prop,
+                    arguments.timeout, arguments.memory)
+                record = {'kind': 'specverify', 'tool': 'specverify', 'mode': 'specverify', 'design': design,
+                          'property': prop,
+                          'requirement': f'{SPECVERIFY_PREFIXES[design]}-{number:03d}{subtest}',
+                          'blocks': blocks.get(number, []), 'verdict': verdict, 'time': took, 'esbmc': version}
+                if violated:
+                    record['violated'] = violated
+                if error:
+                    record['error'] = error
+                out.write(json.dumps(record) + '\n')
+                out.flush()
+                print(f'  {prop} ({record["requirement"]}): {verdict} in {took} s', flush=True)
+            out.write(json.dumps({'kind': 'done', 'model': design, 'mode': 'specverify'}) + '\n')
+            out.flush()
+
+
+def specverify_reported(checkout):
+    """The verdicts SpecVerify reports for its assertions (result/verification_summary.csv,
+    ESBMC's statuses), as records of the property of each problem"""
+    path = os.path.join(checkout, 'result', 'verification_summary.csv')
+    if not os.path.exists(path):
+        return []
+    statuses = {'SUCCESSFUL': 'valid', 'FAILED': 'falsified', 'TIMEOUT': 'undecided', 'UNKNOWN': 'undecided',
+                'ERROR': 'error'}
+    found = []
+    with open(path, encoding='utf-8') as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        if row.get('Attempt') != SPECVERIFY_LLM or row.get('Task') not in SPECVERIFY_PREFIXES:
+            continue
+        folder = os.path.join(checkout, 'result', row['Task'], 'LLM_code', SPECVERIFY_LLM)
+        # the column N is the property N in order (4A and 4B, the fourth and fifth)
+        properties = specverify_properties(specverify_sources(folder))
+        for index, prop in enumerate(properties, start=1):
+            status = (row.get(f'Property_{index}') or '').strip()
+            if status in statuses:
+                found.append({'design': row['Task'], 'property': prop, 'status': status,
+                              'verdict': statuses[status]})
+    return found
+
+
 # The reported results
 
 class _ReportParser(html.parser.HTMLParser):
@@ -1054,9 +1267,15 @@ def reported(arguments):
         results.update(source=relative, design=parts[1],
                        model=parts[4] if len(parts) > 5 else parts[1])
         kind2.append(results)
+    given = {'suite_commit': LM_COMMIT, 'sldv': sldv, 'kind2': kind2}
+    # SpecVerify's, if it was fetched
+    checkout = getattr(arguments, 'specverify', None)
+    if checkout and os.path.isdir(os.path.join(checkout, 'result')):
+        given.update(specverify_commit=SPECVERIFY_COMMIT, specverify=specverify_reported(checkout))
     with open(arguments.out, 'w', encoding='utf-8') as out:
-        json.dump({'suite_commit': LM_COMMIT, 'sldv': sldv, 'kind2': kind2}, out, indent=1)
-    print(f'{arguments.out}: {len(sldv)} SLDV reports, {len(kind2)} Kind2 results')
+        json.dump(given, out, indent=1)
+    print(f'{arguments.out}: {len(sldv)} SLDV reports, {len(kind2)} Kind2 results'
+          + (f', {len(given["specverify"])} SpecVerify verdicts' if 'specverify' in given else ''))
 
 
 # The report
@@ -1085,6 +1304,17 @@ def cell(record):
         text = verdict
     earlier = [v for v in record.get('earlier', []) if v != verdict]
     return text + (f'; earlier run: {", ".join(earlier)}' if earlier else '')
+
+
+def combined(record, other):
+    """The verdict on a block of two properties of SpecVerify of its requirement: falsified if
+    one is, valid if both are"""
+    if record is None:
+        return other
+    order = ('falsified', 'error', 'undecided', 'valid')
+    verdict = min(record['verdict'], other['verdict'], key=lambda v: order.index(v) if v in order else 1)
+    time = None if record.get('time') is None or other.get('time') is None else record['time'] + other['time']
+    return dict(record, verdict=verdict, time=time, properties=record['properties'] + other['properties'])
 
 
 def totals(records):
@@ -1171,6 +1401,16 @@ def describe(mode, info, records):
     if mode == 'sldv':
         return (f'SLDV {", ".join(versions) or "?"} ({info.get("matlab", "MATLAB") if info else "MATLAB"}), '
                 f'property proving on the SLDV model, within {limit}. Rational arithmetic, as in 2019.')
+    if mode == 'specverify':
+        return (f'ESBMC {(info or {}).get("esbmc", "?")} (`--k-induction`, within {(info or {}).get("timeout")} s '
+                f'per property) on the C code of each problem with the assertions that Claude 3.5 Sonnet wrote '
+                f'for its requirements, as SpecVerify (Wang, Farrell, Cordeiro, Zhao, RE 2025) made them '
+                f'(LLM-ReqVerif at `{(info or {}).get("specverify", "?")[:7]}`); the assertions are not '
+                f'written again. The C code is generated from the problem\'s model, not from the SLDV models, '
+                f'and each assertion is the LLM\'s reading of a requirement in natural language, not the '
+                f'SLDV block: its verdict is given to every block of the same requirement (TSM-003 to those '
+                f'of TSM-003a, b and c), and it is left out of the disagreements. The properties per '
+                f'requirement, with the verdicts SpecVerify reports, are below.')
     abstractions = sorted({name for r in records for name in r.get('abstractions', ())})
     unconfirmed = (' A counterexample through a function that CoCoSim\'s library only abstracts, '
                    f'bounding its result ({", ".join(abstractions)}; sin and cos in [-1, 1]), may be the '
@@ -1194,6 +1434,42 @@ def describe(mode, info, records):
             f'{retried}{unconfirmed}')
 
 
+def specverify_section(runs, published):
+    """The lines of the report on SpecVerify: each property measured, with its requirement, the
+    verdict SpecVerify reports and the SLDV blocks it is given to; [] without runs"""
+    if not runs:
+        return []
+    reported_verdicts = {(r['design'], r['property']): r for r in published}
+    lines = ['', '## SpecVerify, per requirement', '',
+             'Each property of SpecVerify: an assertion that Claude 3.5 Sonnet wrote in the C code of the '
+             'problem for its requirement N (the property 4A and 4B, two subtests of the requirement 4), '
+             'checked here by ESBMC, and as SpecVerify reports it (`result/verification_summary.csv`, ESBMC '
+             '7.7.0, 300 s, on another machine: its times are not given). A falsified property says which '
+             'property ESBMC found violated: the assertion, or a check of ESBMC\'s own (an overflow, an index '
+             'out of bounds). The blocks are those of the SLDV models named after the requirement.', '',
+             '| Problem | Property | Requirement | Measured | Reported by SpecVerify | Blocks of the SLDV models |',
+             '| ------- | -------- | ----------- | -------- | ---------------------- | ------------------------- |']
+    for record in sorted(runs, key=lambda r: (r['design'], specverify_number(r['property']))):
+        measured = cell(record)
+        if record.get('violated'):
+            measured += f': {record["violated"][:100]}'
+        if record.get('error'):
+            measured += f': {record["error"][:100]}'
+        given = reported_verdicts.get((record['design'], record['property']))
+        reported_cell = f'{given["verdict"]} ({given["status"]})' if given else '—'
+        blocks = ', '.join(f'{model}: {block}' for model, block in record['blocks']) or 'none'
+        lines.append(f'| {record["design"]} | {record["property"]} | {record["requirement"]} | {measured} '
+                     f'| {reported_cell} | {blocks} |')
+    measured_counts = totals(runs)
+    reported_counts = totals([reported_verdicts[(r['design'], r['property'])] for r in runs
+                              if (r['design'], r['property']) in reported_verdicts])
+    lines += ['', '| SpecVerify, per property | ' + ' | '.join(VERDICTS) + ' |',
+              '| ------------------------ | ' + ' | '.join('-' * len(v) for v in VERDICTS) + ' |',
+              '| measured | ' + ' | '.join(str(measured_counts[v]) for v in VERDICTS) + ' |',
+              '| reported | ' + ' | '.join(str(reported_counts[v]) for v in VERDICTS) + ' |']
+    return lines
+
+
 def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     """Writes the report of runs and of the reported results, in Markdown"""
     with open(arguments.reported, encoding='utf-8') as stream:
@@ -1204,6 +1480,7 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
     unsupported = {}    # (model, mode) -> error
     unsupported_designs = set()
     replays = {}        # (model, property, mode) -> the replay of intrepid's counterexample
+    specverify_runs = []  # the properties of SpecVerify, each with the blocks of its requirement
     for path in arguments.runs:
         info = None
         for record in read_jsonl(path):
@@ -1211,6 +1488,13 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
                 replays[(record['model'], record['property'], record['mode'])] = record
             elif record.get('kind') == 'machine':
                 info = info or record
+            elif record.get('kind') == 'specverify':
+                infos.setdefault(record['mode'], info)
+                specverify_runs.append(record)
+                for model, block in record['blocks']:
+                    key = (model, block, record['mode'])
+                    measured[key] = combined(measured.get(key), dict(record, model=model, property=block,
+                                                                     properties=[record['property']]))
             elif record.get('kind') == 'result':
                 infos.setdefault(record['mode'], info)
                 if record['property'] is None:
@@ -1247,7 +1531,7 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
                      f'{info.get("timeout")} s per property'
                      + (f', {info["memory_per_engine_gb"]:g} GB per engine' if info.get('memory_per_engine_gb') else '')
                      + f' ({tools})'
-                     + ''.join(f'; {name} {info[name]}' for name in ('matlab', 'cocosim', 'kind2', 'z3')
+                     + ''.join(f'; {name} {info[name]}' for name in ('matlab', 'cocosim', 'kind2', 'z3', 'esbmc')
                                if info.get(name)) + '.')
     for mode in modes:
         records = [r for k, r in measured.items() if k[2] == mode]
@@ -1279,8 +1563,13 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
         lines.append(f'| {MODE_TITLES[mode]} | ' + ' | '.join(str(counts[v]) for v in VERDICTS) + ' |')
     lines += ['', 'A model a tool does not translate counts its SLDV properties as unsupported (as errors, '
               'when the tool failed on it). The properties of Kind2 that name no block of the SLDV model '
-              'are not counted: they are listed with their model.', '']
-    for title, path in plots(measured, sldv, modes, out_dir, machines[0].get('timeout', 0) if machines else 0):
+              'are not counted: they are listed with their model.'
+              + (' SpecVerify\'s are counted on the blocks of their requirements (a property on as many '
+                 'blocks as its requirement has), those of no block not at all: they are counted per '
+                 'property below.' if specverify_runs else ''), '']
+    # SpecVerify's on blocks would count a property once per block of its requirement
+    for title, path in plots(measured, sldv, [m for m in modes if m != 'specverify'], out_dir,
+                             machines[0].get('timeout', 0) if machines else 0):
         lines += [f'![{title}]({path})', '']
     lines += ['## Per property', '']
     disagreements = []
@@ -1307,7 +1596,8 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
                 if record is None and (model, mode) in unsupported:
                     record = {'verdict': unsupported[(model, mode)][0]}
                 row.append(cell(record))
-                if record:
+                # SpecVerify checks its own reading of the requirement
+                if record and mode != 'specverify':
                     verdicts[MODE_TITLES[mode]] = record['verdict']
             holds = [t for t, v in verdicts.items() if v in ('valid', 'valid under approximation')]
             fails = [t for t, v in verdicts.items() if v == 'falsified']
@@ -1357,6 +1647,7 @@ def report(arguments):  # pylint: disable=too-many-locals,too-many-branches,too-
                 outcome = f'{record["verdict"]}: {record.get("error", "")}'
             last = record['steps'] - 1 if record.get('steps') else ''
             lines.append(f'| {model} | {prop} | {MODE_TITLES.get(mode, mode)} | {last} | {outcome} |')
+    lines += specverify_section(specverify_runs, given.get('specverify', []))
     lines += ['', '## CoCoSim and Kind2 (reported), per design', '',
               'All the properties of each result, those CoCoSim adds included (the contracts of its '
               'library blocks, whether the modes of a contract are exhaustive), with the timeout of '
@@ -1390,6 +1681,16 @@ def main():
     command.add_argument('--suite', default=SUITE)
     command = commands.add_parser('fetch-cocosim', help='clone CoCoSim at the pinned commit, and set it up')
     command.add_argument('--into', default=matlab.COCOSIM)
+    command = commands.add_parser('fetch-specverify', help="clone SpecVerify's repository at the pinned commit")
+    command.add_argument('--into', default=SPECVERIFY)
+    command = commands.add_parser('specverify', help="run ESBMC on SpecVerify's assertions (no MATLAB)")
+    command.add_argument('out')
+    command.add_argument('--esbmc', required=True, help='the ESBMC executable')
+    command.add_argument('--timeout', type=float, default=120.0, help='seconds per property')
+    command.add_argument('--memory', type=float, default=8.0, help='gigabytes ESBMC may use (8, as SpecVerify)')
+    command.add_argument('--filter', help='only the problems (0_triplex, ...) matching this regular expression')
+    command.add_argument('--suite', default=SUITE)
+    command.add_argument('--specverify', default=SPECVERIFY, help='SpecVerify, fetched by fetch-specverify')
     for name, helped in (('sldv', 'run SLDV on the SLDV models (MATLAB)'),
                          ('cocosim', 'run CoCoSim and Kind2 on the SLDV models (MATLAB)'),
                          ('kind2', "run Kind2 on CoCoSim's Lustre of 2019 (no MATLAB)")):
@@ -1424,9 +1725,10 @@ def main():
                          help='seconds per property, to find again a counterexample the results lack')
     command.add_argument('--filter', help='only the models whose path matches this regular expression')
     command.add_argument('--suite', default=SUITE)
-    command = commands.add_parser('reported', help='read the results the suite reports')
+    command = commands.add_parser('reported', help='read the results the suite (and SpecVerify, if fetched) reports')
     command.add_argument('out')
     command.add_argument('--suite', default=SUITE)
+    command.add_argument('--specverify', default=SPECVERIFY)
     command = commands.add_parser('report', help='write the report')
     command.add_argument('runs', nargs='+')
     command.add_argument('--reported', required=True)
@@ -1436,6 +1738,11 @@ def main():
         fetch(arguments.into)
     elif arguments.command == 'fetch-cocosim':
         matlab.fetch_cocosim(arguments.into)
+    elif arguments.command == 'fetch-specverify':
+        fetch(arguments.into, SPECVERIFY_URL, SPECVERIFY_COMMIT)
+    elif arguments.command == 'specverify':
+        arguments.esbmc = os.path.abspath(shutil.which(arguments.esbmc) or arguments.esbmc)
+        specverify(arguments)
     elif arguments.command == 'run':
         run(arguments)
     elif arguments.command in ('sldv', 'cocosim', 'kind2'):

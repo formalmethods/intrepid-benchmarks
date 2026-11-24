@@ -4,9 +4,9 @@ The benchmarks of [intrepid](https://github.com/formalmethods/intrepyd), the
 model checker behind intrepyd, with everything needed to run them again on
 your own machine:
 
-- **Simulink**: intrepid against Simulink Design Verifier (SLDV) and CoCoSim
-  on the Simulink designs of the Lockheed Martin cyber-physical challenges,
-  as NASA formalized them;
+- **Simulink**: intrepid against Simulink Design Verifier (SLDV), CoCoSim
+  and SpecVerify on the Simulink designs of the Lockheed Martin
+  cyber-physical challenges, as NASA formalized them;
 - **Lustre**: intrepid against [Kind2](https://kind2-mc.github.io/kind2/) on
   the Kind2 benchmark suite.
 
@@ -22,8 +22,9 @@ On Linux, with Python 3.11 or newer and git:
 make setup      # .venv, with intrepyd (and its Simulink translator) and matplotlib
 make check      # the tests of the harnesses
 make simulink   # the Simulink benchmark: results/simulink.md
-make simulink-tools MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=...   # SLDV, CoCoSim and Kind2, measured
-make simulink-all MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=...     # all of it: intrepid and the other tools
+make simulink-tools MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=... ESBMC=...   # SLDV, CoCoSim, Kind2 and SpecVerify, measured
+make simulink-all MATLAB=... KIND2=... COCOSIM_KIND2=... Z3=... ESBMC=...     # all of it: intrepid and the other tools
+make simulink-specverify ESBMC=...   # SpecVerify alone (no MATLAB), then the report
 make lustre     # the Lustre benchmark, intrepid alone: its report on the terminal
 ```
 
@@ -31,7 +32,7 @@ make lustre     # the Lustre benchmark, intrepid alone: its report on the termin
 intrepyd instead of the one on PyPI. Any other environment with intrepyd
 1.0.1 or newer works too: `make simulink PYTHON=/path/to/python`.
 
-## Simulink: intrepid, SLDV and CoCoSim
+## Simulink: intrepid, SLDV, CoCoSim and SpecVerify
 
 ### The designs
 
@@ -148,12 +149,45 @@ library, so SLDV needs it too. MATLAB runs without its desktop, but needs a
 display: some of the models do not load with `-nodisplay`. CoCoSim is
 tested with R2017b and newer; the runs here were made with R2018a.
 
+**SpecVerify** ("Supporting Software Formal Verification with Large Language
+Models: An Experimental Study", Wang, Farrell, Cordeiro and Zhao, RE 2025)
+needs no MATLAB either (`make simulink-specverify ESBMC=...`). In SpecVerify,
+Claude 3.5 Sonnet read the requirements of nine of the problems (all but the
+autopilot) and wrote assertions for them, `VERIFY_PROPERTY_N` for the
+requirement N, in the C code that Embedded Coder generated from each
+problem's model. [ESBMC](https://github.com/esbmc/esbmc) then checked them
+one at a time, with k-induction. The assertions were written by hand in
+Claude's chat, and are published in
+[LLM-ReqVerif](https://github.com/LLM-ReqVerif/LLM-ReqVerif):
+`make fetch-specverify` clones it at a fixed commit (`30ec5ce`) into
+`third_party/specverify`, without copying it here (it has no license file).
+The benchmark does not ask an LLM again: it runs ESBMC on those assertions,
+within `TIMEOUT` seconds and `MEMORY` gigabytes per property, as SpecVerify
+did (`ert_main.c` and the model's code, not the tests next to them).
+
+SpecVerify's properties are not the SLDV blocks. Each is the LLM's reading of
+a requirement, on the C code. So each property is given every block of the
+SLDV models named after its requirement: the property 3 of the triplex goes
+to TSM-003a, b and c; the property 1 of the Euler problem goes to the nine
+blocks of EUL-001. Its verdicts are not counted among the disagreements. The
+report also lists SpecVerify property by property: the requirement, the
+verdict measured here, what ESBMC found violated (the assertion, or a check
+of its own, such as an overflow), the verdict SpecVerify reports, and the
+blocks the property was given to. Properties with no block are listed there
+only: the subtests 4A and 4B of the Tustin integrator, and the nonlinear
+guidance, whose SLDV model is an MDL. SpecVerify's logs name ESBMC 7.7.0,
+which has no published binary: give `ESBMC` the version you have, and the
+report names it (the runs here use v8.8, the release of
+`esbmc-linux.zip`).
+
 The results the suite reports are read too (`simulink/harness.py reported`):
 
 - SLDV's reports, made in 2019 with rational arithmetic, each with its own
   time limit (from 300 to 7200 s). Where a model has several reports, the
   latest one is taken, and an earlier one that said otherwise is noted.
 - Kind2's results on CoCoSim's Lustre of the `CoCoSim` models, per design.
+- SpecVerify's ESBMC statuses (`result/verification_summary.csv`), if
+  `third_party/specverify` was fetched: ESBMC 7.7.0, 300 s per property.
 
 These results come from another machine and other versions, years ago: their
 times are not comparable with the measured ones. The report says which
@@ -176,6 +210,8 @@ make fetch-cocosim                                   # third_party/cocosim
 make simulink-kind2 COCOSIM_KIND2=/path/to/kind2-v1.7.0 KIND2=/path/to/kind2 Z3=/path/to/z3   # results/kind2-2019.jsonl
 make simulink-sldv MATLAB=/path/to/matlab                       # results/sldv.jsonl
 make simulink-cocosim MATLAB=/path/to/matlab COCOSIM_KIND2=/path/to/kind2-v1.7.0 Z3=...   # results/cocosim.jsonl
+make fetch-specverify                                # third_party/specverify
+make simulink-specverify-run ESBMC=/path/to/esbmc               # results/specverify.jsonl
 make simulink-replay MATLAB=/path/to/matlab                     # results/replays.jsonl
 make simulink-report                                 # all of them in results/simulink.md
 ```
@@ -186,7 +222,7 @@ system needs for it): it is given MATLAB's options.
 The variables:
 
 - `TIMEOUT=300`: the seconds per property;
-- `MEMORY=16`: the gigabytes each engine of intrepid may use;
+- `MEMORY=16`: the gigabytes each engine of intrepid may use (and ESBMC);
 - `MODES=float,real,float-finite,float-free`: the modes;
 - `FILTER=euler`: only the models whose path matches a regular expression;
 - `RESULTS=elsewhere`: the folder of the results.
@@ -229,12 +265,12 @@ version intrepid is built with.
 
 | Path | What |
 | ---- | ---- |
-| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `sldv`, `cocosim`, `kind2`, `replay`, `reported`, `report` |
+| `simulink/harness.py` | The Simulink benchmark: `fetch`, `run`, `sldv`, `cocosim`, `kind2`, `fetch-specverify`, `specverify`, `replay`, `reported`, `report` |
 | `simulink/matlab.py`, `simulink/matlab/` | CoCoSim's setup, and the MATLAB scripts of the SLDV and CoCoSim runs and of the replays |
 | `lustre/harness.py`, `lustre/run_one.py` | The Lustre benchmark |
 | `lustre/kind2-benchmarks/` | The Kind2 benchmark suite |
 | `tests/` | The tests of the harnesses: `make check` |
-| `third_party/` | The fetched suites and CoCoSim (not committed) |
+| `third_party/` | The fetched suites, CoCoSim and SpecVerify (not committed) |
 | `results/` | The results of the runs (not committed) |
 
 ## License
@@ -242,6 +278,6 @@ version intrepid is built with.
 The harnesses, their tests and this documentation are under the MIT license
 ([LICENSE](LICENSE)). `lustre/kind2-benchmarks/` is the Kind2 benchmark
 suite, under the terms of its authors. The suites fetched into
-`third_party/` (the Lockheed Martin challenges, CoCoSim) are not part of this
+`third_party/` (the Lockheed Martin challenges, CoCoSim, SpecVerify) are not part of this
 repository and keep their own terms. intrepyd, which the harnesses run, has
 its own license, with a free non-commercial one.
