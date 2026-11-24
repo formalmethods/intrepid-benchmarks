@@ -180,6 +180,16 @@ which has no published binary: give `ESBMC` the version you have, and the
 report names it (the runs here use v8.8, the release of
 `esbmc-linux.zip`).
 
+With v8.8 and 120 s, 55 of the 58 properties get the verdict SpecVerify
+reports. The other three were valid in SpecVerify's summary, but its own
+logs show nothing was checked. TSM-004 is valid in its log with no
+verification conditions at all ("Generated 0 VCC(s)"). Here, v8.8 generates
+conditions and falsifies the assertion. The Tustin columns 4 and 5
+come from a run with `-DVERIFY_PROPERTY_4`, but the code defines only `4A`
+and `4B`, so that run checked no assertion. SpecVerify's separate log of 4A
+reports a counterexample. Here, 4B is falsified and 4A is undecided within
+120 s.
+
 The results the suite reports are read too (`simulink/harness.py reported`):
 
 - SLDV's reports, made in 2019 with rational arithmetic, each with its own
